@@ -1,6 +1,5 @@
-// 博弈小屋 GameHub · Client 半（浏览器界面：大厅/房间/棋盘/分享卡片）
-// 来源：动态插件 game-7/pkg-11。此文件与 gamehub.host.js 配套使用。
-// 安装方式见 README.md —— 在 DSH 会话中让助手读取这两个文件并用 cordis_define 创建动态插件。
+// 博弈小屋 GameHub · 动态插件 Client 半（v8：侧栏按钮 + 浮层面板 + 运行卡片 + 独立页面入口）
+// 来源：game-7/pkg-15。此文件与 gamehub.host.js 配套，在 DSH 会话中用 cordis_define 创建动态插件。
 return {
   inject: ['timer'],
   apply(ctx) {
@@ -37,7 +36,68 @@ return {
 .gh-win{text-align:center;font-size:15px;font-weight:700;padding:10px 0;color:rgba(90,200,120,.95)}
 .gh-pond{display:flex;align-items:center;justify-content:center;gap:8px;font-size:16px;padding:6px 0}
 .gh-pond b{font-size:34px;color:rgba(244,162,89,.95)}
+.gh-page-link{display:inline-block;margin-left:auto;font-size:12px;color:rgba(120,150,255,.9);text-decoration:none;border:1px solid rgba(120,150,255,.4);border-radius:8px;padding:3px 10px}
+.gh-side-btn{display:flex;align-items:center;justify-content:center;width:100%;border:none;background:transparent;color:inherit;cursor:pointer;font-size:15px;padding:6px 0}
+.gh-side-btn:hover{background:rgba(128,128,128,.15)}
+.gh-side-wide{display:flex;align-items:center;gap:8px;width:100%;border:none;background:transparent;color:inherit;cursor:pointer;font-size:13px;padding:8px 12px;text-align:left}
+.gh-side-wide:hover{background:rgba(128,128,128,.15)}
+.gh-overlay{position:fixed;top:16px;right:16px;width:440px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow-y:auto;background:rgba(20,24,38,.97);border:1px solid rgba(128,128,128,.3);border-radius:16px;box-shadow:0 8px 40px rgba(0,0,0,.5);z-index:9999;pointer-events:auto;padding:12px 14px;color:#eef4ed}
+.gh-overlay-head{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:700;padding-bottom:8px;border-bottom:1px solid rgba(128,128,128,.2);margin-bottom:10px}
+.gh-overlay-close{margin-left:auto;border:none;background:rgba(128,128,128,.2);color:inherit;border-radius:8px;width:26px;height:26px;cursor:pointer;font-size:13px}
+.gh-overlay-close:hover{background:rgba(128,128,128,.35)}
+.gh-overlay .gh-root{max-width:100%}
 `)
+
+    // 弹窗开关状态（侧栏按钮 ↔ 浮层面板共享）
+    const bus = { open: false, subs: [] }
+    function setOverlay(open) {
+      bus.open = !!open
+      bus.subs.forEach(function (fn) { fn(bus.open) })
+    }
+    function useOverlayOpen() {
+      const [open, setOpen] = React.useState(bus.open)
+      React.useEffect(function () {
+        const fn = function (v) { setOpen(v) }
+        bus.subs.push(fn)
+        return function () {
+          const i = bus.subs.indexOf(fn)
+          if (i >= 0) bus.subs.splice(i, 1)
+        }
+      }, [])
+      return [open, setOverlay]
+    }
+
+    // 侧栏底部入口按钮（新增，不替换现有项）
+    slots.inject('sidebar.footer.action', () => slots.register(
+      { name: 'sidebar.footer.action', id: 'gamehub', order: -10, label: '博弈小屋' },
+      (props) => {
+        const [open, setOpen] = useOverlayOpen()
+        const wide = !!props.wide
+        return React.createElement('button', {
+          className: wide ? 'gh-side-wide' : 'gh-side-btn',
+          title: '博弈小屋 · 游戏大厅',
+          onClick: function () { setOpen(!open) }
+        }, wide ? React.createElement('span', null, '🎮 博弈小屋') : React.createElement('span', null, '🎮'))
+      }
+    ))
+
+    // 全局浮层面板：完整游戏大厅，点击侧栏按钮开合
+    slots.inject('shell.overlay', () => slots.register(
+      { name: 'shell.overlay', id: 'gamehub-panel', order: 0, label: '博弈小屋面板' },
+      (props) => {
+        const [open] = useOverlayOpen()
+        if (!open) return null
+        return React.createElement('div', { className: 'gh-overlay' },
+          React.createElement('div', { className: 'gh-overlay-head' },
+            React.createElement('span', null, '🎮 博弈小屋'),
+            React.createElement('button', { className: 'gh-overlay-close', onClick: function () { setOverlay(false) } }, '✕')
+          ),
+          React.createElement(GameHub, { ctx: ctx, sessionId: null })
+        )
+      }
+    ))
+
+    // 运行卡片内的界面（保留）
     slots.inject('tool.view.cordis', () => slots.register(
       { name: 'tool.view.cordis', key: 'self' },
       (props) => React.createElement(GameHub, { ctx: ctx, sessionId: props.sessionId })
@@ -56,6 +116,7 @@ return {
       const [msg, setMsg] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [rooms, setRooms] = React.useState([])
+      const [pageUrl, setPageUrl] = React.useState('')
 
       React.useEffect(function () { init() }, [])
       React.useEffect(function () {
@@ -74,6 +135,8 @@ return {
           setName(r.name)
           const g = await host.call('games')
           setGames(g || [])
+          const u = await host.call('page-url')
+          if (u && u.url) setPageUrl(u.url)
         } catch (e) { setMsg('初始化失败: ' + String(e && e.message || e)) }
       }
       async function refreshRoom() {
@@ -135,13 +198,14 @@ return {
         return React.createElement(RoomView, {
           room: room, invite: invite, playerId: playerId, name: name, setName: setName,
           busy: busy, msg: msg, setMsg: setMsg,
-          onMove: doMove, onLeave: doLeave
+          onMove: doMove, onLeave: doLeave, pageUrl: pageUrl
         })
       }
       return React.createElement(LobbyView, {
         games: games, rooms: rooms, codeInput: codeInput, setCodeInput: setCodeInput,
         name: name, setName: setName, msg: msg, setMsg: setMsg, busy: busy,
-        onCreate: doCreate, onQuick: doQuick, onJoin: doJoin, onName: doSetName, onRefresh: refreshRooms
+        onCreate: doCreate, onQuick: doQuick, onJoin: doJoin, onName: doSetName, onRefresh: refreshRooms,
+        pageUrl: pageUrl
       })
     }
 
@@ -165,7 +229,11 @@ return {
         )
       })
       return React.createElement('div', { className: 'gh-root' },
-        React.createElement('div', { className: 'gh-header' }, '🎮 博弈小屋'),
+        React.createElement('div', { className: 'gh-header' },
+          React.createElement('span', null, '🎮 博弈小屋'),
+          p.pageUrl ? React.createElement('a', { className: 'gh-page-link', href: p.pageUrl, target: '_blank', rel: 'noreferrer' }, '打开独立页面 ↗')
+            : null
+        ),
         React.createElement('div', { className: 'gh-sub' }, '博弈游戏大厅：创建房间 / 快速匹配 / 人机对战，房间号可任意形式分享'),
         React.createElement('div', { className: 'gh-card' },
           React.createElement('div', { className: 'gh-row' },
@@ -338,12 +406,13 @@ return {
         React.createElement('div', { className: 'gh-header' },
           React.createElement('span', null, room.gameIcon + ' ' + room.gameName),
           statusChip,
+          p.pageUrl ? React.createElement('a', { className: 'gh-page-link', href: p.pageUrl, target: '_blank', rel: 'noreferrer' }, '独立页面 ↗') : null,
           React.createElement('button', { className: 'gh-btn', disabled: p.busy, onClick: p.onLeave, style: { marginLeft: 'auto' } }, '退出房间')
         ),
         React.createElement('div', { className: 'gh-card' },
           React.createElement('div', { className: 'gh-code' }, room.code),
           React.createElement('div', { className: 'gh-sub', style: { textAlign: 'center' } }, '房间号 · 分享给朋友即可加入'),
-          invite && invite.text ? React.createElement('textarea', { className: 'gh-textarea', readOnly: true, rows: 5, value: invite.text, onFocus: function (e) { e.target.select() } }) : null
+          p.invite && p.invite.text ? React.createElement('textarea', { className: 'gh-textarea', readOnly: true, rows: 5, value: p.invite.text, onFocus: function (e) { e.target.select() } }) : null
         ),
         React.createElement('div', { className: 'gh-card' }, playersRow),
         board,

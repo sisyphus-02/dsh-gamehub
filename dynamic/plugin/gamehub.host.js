@@ -1,6 +1,5 @@
-// 博弈小屋 GameHub · Host 半（引擎/大厅/匹配/HTTP API/模型工具）
-// 来源：动态插件 game-7/pkg-11。此文件与 gamehub.client.js 配套使用。
-// 安装方式见 README.md —— 在 DSH 会话中让助手读取这两个文件并用 cordis_define 创建动态插件。
+// 博弈小屋 GameHub · 动态插件 Host 半（v8：独立页面 + 可写 API + 安全护栏）
+// 来源：game-7/pkg-15。此文件与 gamehub.client.js 配套，在 DSH 会话中用 cordis_define 创建动态插件。
 return {
   inject: ['timer'],
   apply(ctx) {
@@ -9,7 +8,7 @@ return {
     const sandboxPolicy = ctx.get('sandboxPolicy')
     const webServer = ctx.get('webServer')
 
-    // ---------- shared lobby persistence (cross-session matchmaking) ----------
+    // ---------- shared lobby persistence (same-machine cross-session) ----------
     const LOBBY_NAME = 'dsh-gamehub-lobby.json'
     let lobbyPath = null
     let memoryLobby = null
@@ -95,7 +94,7 @@ return {
       return lobby.players[playerId] || { name: '玩家' + String(playerId).slice(-4) }
     }
 
-    // ---------- games registry (博弈游戏待定 → 可扩展) ----------
+    // ---------- games registry ----------
     const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
     function genCode(lobby) {
       for (let i = 0; i < 60; i++) {
@@ -115,7 +114,7 @@ return {
       return null
     }
 
-    // ---------- 共鱼 · 鱼塘博弈 (来自原型 共鱼.html) ----------
+    // ---------- 共鱼 · 鱼塘博弈 ----------
     const GONGYU_CFG = { startFish: 12, cap: 20, rounds: 6, minTake: 1, maxTake: 3, cost: 1, dock: 3 }
     const GONGYU_BOTS = [
       { name: '😇 老好人', type: 'nice' },
@@ -264,8 +263,8 @@ return {
             const cur = r.players[s.punishOrder]
             if (cur && cur.isBot) {
               const idx = s.punishOrder
-              const ctx = gongyuPunishCtx(r, idx)
-              const t = gongyuBotPunish(r.players, idx, ctx)
+              const ctx2 = gongyuPunishCtx(r, idx)
+              const t = gongyuBotPunish(r.players, idx, ctx2)
               if (t != null) {
                 s.punishes.push({ from: cur.id, to: r.players[t].id })
                 s.spent[cur.id] = (s.spent[cur.id] || 0) + GONGYU_CFG.cost
@@ -386,13 +385,12 @@ return {
           const mark = botIdx === 0 ? 'X' : 'O'
           const opp = mark === 'X' ? 'O' : 'X'
           const board = state.board
-          const lines = TTT_LINES
-          for (const l of lines) {
+          for (const l of TTT_LINES) {
             const mine = l.filter(function (i) { return board[i] === mark })
             const empty = l.filter(function (i) { return board[i] === null })
             if (mine.length === 2 && empty.length === 1) return empty[0]
           }
-          for (const l of lines) {
+          for (const l of TTT_LINES) {
             const theirs = l.filter(function (i) { return board[i] === opp })
             const empty = l.filter(function (i) { return board[i] === null })
             if (theirs.length === 2 && empty.length === 1) return empty[0]
@@ -599,35 +597,94 @@ return {
       return { ok: true }
     }
 
+    // ---------- 安全护栏 ----------
+    const NAME_MAX = 16
+    const CODE_RE = /^[A-Z0-9]{4}$/
+    function sanitizeName(raw) {
+      const s = String(raw == null ? '' : raw).replace(/[\r\n\u0000-\u001f]/g, '').trim().slice(0, NAME_MAX)
+      return s || '玩家'
+    }
+    function sanitizeCode(raw) {
+      const s = String(raw == null ? '' : raw).trim().toUpperCase()
+      return CODE_RE.test(s) ? s : ''
+    }
+    function sanitizePlayerId(raw) {
+      return String(raw == null ? '' : raw).replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 40)
+    }
     function playerOf(args) {
-      const pid = (args && args.playerId) || 'u-' + Math.random().toString(36).slice(2, 8)
-      const nm = (args && args.name) || '玩家'
-      return { id: String(pid).slice(0, 40), name: String(nm).slice(0, 16) }
+      const pid = sanitizePlayerId((args && args.playerId) || ('u-' + Math.random().toString(36).slice(2, 8)))
+      return { id: pid || ('u-' + Math.random().toString(36).slice(2, 8)), name: sanitizeName(args && args.name) }
     }
 
-    // ---------- HTTP share API (联网匹配 / 任意形式分享) ----------
+    // ---------- HTTP API（只读 + 可写，全部校验） ----------
     if (webServer) {
       const respondJson = function (res, data, status) {
-        res.writeHead(status || 200, { 'content-type': 'application/json; charset=utf-8' })
+        res.writeHead(status || 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify(data))
       }
-      const parseCode = function (req) {
+      const parseQuery = function (req) {
         const raw = String(req.url || '')
         const qi = raw.indexOf('?')
         const qs = qi >= 0 ? raw.slice(qi + 1) : ''
-        const parts = qs.split('&')
-        for (const part of parts) {
-          if (part.indexOf('code=') === 0) return part.slice(5).toUpperCase()
-        }
-        return ''
+        const out = {}
+        qs.split('&').forEach(function (part) {
+          const eq = part.indexOf('=')
+          if (eq <= 0) return
+          out[part.slice(0, eq)] = part.slice(eq + 1)
+        })
+        return out
+      }
+      const readBody = function (req) {
+        return new Promise(function (resolve) {
+          let data = ''
+          req.on('data', function (c) {
+            data += c
+            if (data.length > 65536) { req.destroy(); resolve({}) }
+          })
+          req.on('end', function () {
+            try { resolve(JSON.parse(data || '{}')) } catch (e) { resolve({}) }
+          })
+          req.on('error', function () { resolve({}) })
+        })
       }
       try {
         const exact = webServer.exact
         if (exact && typeof exact.delete === 'function') {
           exact.delete('/api/gamehub/lobby')
           exact.delete('/api/gamehub/room')
+          exact.delete('/api/gamehub/peers')
+          exact.delete('/api/gamehub/create')
+          exact.delete('/api/gamehub/join')
+          exact.delete('/api/gamehub/quick')
+          exact.delete('/api/gamehub/move')
+          exact.delete('/api/gamehub/leave')
+          exact.delete('/api/gamehub/games')
+          exact.delete('/api/gamehub/share')
+          exact.delete('/gamehub')
         }
       } catch (e) { /* ignore */ }
+
+      // ---- 独立页面 ----
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/gamehub',
+        handler: function (req, res) {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(GAMEHUB_PAGE)
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/games',
+        handler: function (req, res) {
+          respondJson(res, { ok: true, games: Object.keys(GAMES).map(function (id) {
+            const g = GAMES[id]
+            return { id: id, name: g.name, icon: g.icon, desc: g.desc, kind: g.kind, rounds: g.rounds, maxPlayers: g.maxPlayers, moveLabels: g.moveLabels }
+          }) })
+        }
+      }))
+
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/api/gamehub/lobby',
@@ -640,19 +697,138 @@ return {
           respondJson(res, { ok: true, rooms: rooms })
         }
       }))
-      try {
-        ctx.effect(() => webServer.register({
-          kind: 'exact',
-          path: '/api/gamehub/room',
-          handler: async function (req, res) {
-            const code = parseCode(req)
-            const lobby = await readLobby()
-            const room = lobby.rooms[code]
-            if (!room) return respondJson(res, { ok: false, error: '房间不存在' }, 404)
-            respondJson(res, { ok: true, room: roomView(room, null), share: sharePayload(room) })
-          }
-        }))
-      } catch (e) { /* 已注册 */ }
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/room',
+        handler: async function (req, res) {
+          const q = parseQuery(req)
+          const code = String(q.code || '').toUpperCase()
+          if (!CODE_RE.test(code)) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const lobby = await readLobby()
+          const room = lobby.rooms[code]
+          if (!room) return respondJson(res, { ok: false, error: '房间不存在' }, 404)
+          respondJson(res, { ok: true, room: roomView(room, sanitizePlayerId(q.playerId) || null), share: sharePayload(room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/share',
+        handler: async function (req, res) {
+          const q = parseQuery(req)
+          const code = String(q.code || '').toUpperCase()
+          if (!CODE_RE.test(code)) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const lobby = await readLobby()
+          const room = lobby.rooms[code]
+          if (!room) return respondJson(res, { ok: false, error: '房间不存在' }, 404)
+          respondJson(res, { ok: true, share: sharePayload(room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/peers',
+        handler: async function (req, res) {
+          const lobby = await readLobby()
+          const waiting = Object.keys(lobby.rooms)
+            .map(function (code) { return lobby.rooms[code] })
+            .filter(function (r) { return r.status === 'waiting' })
+            .map(function (r) { return { code: r.code, game: r.game, gameName: GAMES[r.game].name, host: r.players[0] ? r.players[0].name : '' } })
+          respondJson(res, { ok: true, waiting: waiting })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/create',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const gameId = GAMES[body && body.game] ? body.game : ''
+          if (!gameId) return respondJson(res, { ok: false, error: '未知游戏' }, 400)
+          const player = playerOf(body)
+          const withBot = !!(body && body.withBot)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = createRoom(lobby, gameId, player, withBot)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '创建失败' }, 400)
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/join',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          if (!code) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const player = playerOf(body)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = joinRoom(lobby, code, player)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '加入失败' }, 400)
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/quick',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const gameId = GAMES[body && body.game] ? body.game : ''
+          if (!gameId) return respondJson(res, { ok: false, error: '未知游戏' }, 400)
+          const player = playerOf(body)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = quickMatch(lobby, gameId, player)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '匹配失败' }, 400)
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/move',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          if (!code) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const pid = sanitizePlayerId(body && body.playerId)
+          if (!pid) return respondJson(res, { ok: false, error: '缺少玩家身份' }, 400)
+          let out = null
+          await mutateLobby(function (lobby) {
+            out = applyPlayerMove(lobby, code, pid, body && body.move)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '落子失败' }, 400)
+          respondJson(res, { ok: true, room: out.room })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/leave',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          if (!code) return respondJson(res, { ok: true })
+          const pid = sanitizePlayerId(body && body.playerId)
+          await mutateLobby(function (lobby) { leaveRoom(lobby, code, pid) })
+          respondJson(res, { ok: true })
+        }
+      }))
     }
 
     // ---------- Client RPC ----------
@@ -667,9 +843,15 @@ return {
       return { playerId: playerId, name: name }
     })
 
+    harness.handle('page-url', async function () {
+      let url = ''
+      try { if (webServer && webServer.port) url = 'http://127.0.0.1:' + webServer.port + '/gamehub' } catch (e) { url = '' }
+      return { url: url }
+    })
+
     harness.handle('set-name', async function (args) {
       const pid = args && args.playerId
-      const nm = String((args && args.name) || '玩家').slice(0, 16)
+      const nm = sanitizeName((args && args.name) || '玩家')
       if (!pid) return { error: '缺少 playerId' }
       await mutateLobby(function (lobby) {
         lobby.players[pid] = { name: nm, updatedAt: Date.now() }
@@ -710,7 +892,7 @@ return {
 
     harness.handle('join', async function (args) {
       const player = playerOf(args)
-      const code = String((args && args.code) || '').toUpperCase().trim()
+      const code = sanitizeCode(args && args.code)
       if (!code) return { error: '请输入房间号' }
       let out = null
       await mutateLobby(function (lobby) {
@@ -734,38 +916,244 @@ return {
     })
 
     harness.handle('state', async function (args) {
-      const code = String((args && args.code) || '').toUpperCase().trim()
+      const code = sanitizeCode(args && args.code)
       if (!code) return null
       const lobby = await readLobby()
       const room = lobby.rooms[code]
       if (!room) return null
-      return roomView(room, (args && args.playerId) || null)
+      return roomView(room, sanitizePlayerId((args && args.playerId) || null))
     })
 
     harness.handle('move', async function (args) {
-      const code = String((args && args.code) || '').toUpperCase().trim()
+      const code = sanitizeCode(args && args.code)
       let out = null
       await mutateLobby(function (lobby) {
-        out = applyPlayerMove(lobby, code, args && args.playerId, args && args.move)
+        out = applyPlayerMove(lobby, code, sanitizePlayerId(args && args.playerId), args && args.move)
       })
       return out
     })
 
     harness.handle('leave', async function (args) {
-      const code = String((args && args.code) || '').toUpperCase().trim()
-      await mutateLobby(function (lobby) { leaveRoom(lobby, code, args && args.playerId) })
+      const code = sanitizeCode(args && args.code)
+      await mutateLobby(function (lobby) { leaveRoom(lobby, code, sanitizePlayerId(args && args.playerId)) })
       return { ok: true }
     })
 
     harness.handle('share', async function (args) {
-      const code = String((args && args.code) || '').toUpperCase().trim()
+      const code = sanitizeCode(args && args.code)
       const lobby = await readLobby()
       const room = lobby.rooms[code]
       if (!room) return { error: '房间不存在' }
       return sharePayload(room)
     })
 
-    // ---------- model-visible tool: 通过对话创建/分享/对弈 ----------
+    // ---------- 独立页面 HTML ----------
+    const GAMEHUB_PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎮 博弈小屋</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:linear-gradient(180deg,#0b2545,#134074);color:#eef4ed;min-height:100vh}
+.wrap{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:24px;text-align:center;margin:8px 0 2px}
+.sub{text-align:center;opacity:.7;font-size:12px;margin-bottom:14px}
+.card{background:rgba(255,255,255,.08);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{flex:1;border:none;border-radius:10px;padding:10px 0;font-size:14px;font-weight:700;cursor:pointer;background:#f4a259;color:#1a1a1a}
+.btn.ghost{background:rgba(255,255,255,.15);color:#eef4ed}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.small{flex:0 0 auto;padding:6px 14px;font-size:12px;border-radius:8px}
+.game{background:rgba(255,255,255,.07);border-radius:12px;padding:12px;margin-bottom:10px}
+.game h3{font-size:15px;margin-bottom:2px}
+.game .desc{font-size:12px;opacity:.7;margin-bottom:8px}
+.game .btns{display:flex;gap:6px}
+.game .btns .btn{flex:1;font-size:12px;padding:8px 0}
+input{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:10px;color:#eef4ed;padding:10px 12px;font-size:14px;flex:1;min-width:100px}
+input::placeholder{color:rgba(238,244,237,.4)}
+.code{font-size:30px;font-weight:700;letter-spacing:8px;text-align:center;padding:10px 0;font-family:monospace;color:#f4a259}
+.status{font-size:12px;padding:2px 10px;border-radius:999px;background:rgba(255,180,60,.25)}
+.status.on{background:rgba(90,200,120,.3)}
+.status.end{background:rgba(255,90,90,.3)}
+.msg{font-size:12px;color:#ff9a9a;margin:6px 0}
+.note{font-size:11px;opacity:.55;margin-top:6px}
+.log{font-size:12px;opacity:.85;line-height:1.7}
+textarea{width:100%;box-sizing:border-box;background:rgba(255,255,255,.06);border:1px dashed rgba(255,255,255,.35);border-radius:10px;color:#eef4ed;font-size:12px;padding:8px;resize:vertical;font-family:inherit}
+.board{display:grid;grid-template-columns:repeat(3,68px);gap:6px;justify-content:center;margin:12px 0}
+.cell{width:68px;height:68px;font-size:28px;background:rgba(255,255,255,.1);border:none;border-radius:10px;color:#eef4ed;cursor:pointer}
+.cell:disabled{cursor:not-allowed;opacity:.8}
+.moves{display:flex;gap:8px;justify-content:center;margin:12px 0}
+.moves .btn{flex:0 0 auto;padding:12px 18px;font-size:15px}
+.wait{font-size:13px;opacity:.75;text-align:center;padding:8px 0}
+.win{text-align:center;font-size:16px;font-weight:700;padding:12px 0;color:#7ee2a8}
+.pond{display:flex;align-items:center;justify-content:center;gap:8px;font-size:18px}
+.pond b{font-size:38px;color:#f4a259}
+.player{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.07);margin-bottom:6px;font-size:13px}
+.player.me{outline:1px solid #f4a259}
+.tag{font-size:11px;background:rgba(255,255,255,.15);padding:2px 6px;border-radius:6px}
+.medal{font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+'use strict';
+const app = document.getElementById('app');
+let S = { pid:'', name:'', view:'lobby', games:[], room:null, invite:null, rooms:[], codeInput:'', msg:'', busy:false };
+
+function genPid(){ return 'u-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4); }
+function init(){
+  let pid = '';
+  try { pid = localStorage.getItem('gamehub_pid') || ''; } catch(e){}
+  if (!pid) { pid = genPid(); try { localStorage.setItem('gamehub_pid', pid); } catch(e){} }
+  let name = '';
+  try { name = localStorage.getItem('gamehub_name') || ''; } catch(e){}
+  S.pid = pid; S.name = name || '玩家' + pid.slice(-4);
+  api('games').then(function(r){ if (r && r.ok) { S.games = r.games; render(); } });
+  refreshRooms();
+}
+function api(path, body){
+  const opts = { method: body ? 'POST' : 'GET' };
+  if (body) opts.headers = { 'content-type': 'application/json' };
+  if (body) opts.body = JSON.stringify(body);
+  return fetch(path, opts).then(function(r){ return r.json(); }).catch(function(){ return { ok:false, error:'网络错误' }; });
+}
+function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]; }); }
+function refreshRooms(){
+  api('lobby').then(function(r){ if (r && r.ok) { S.rooms = r.rooms.filter(function(x){ return x.status === 'waiting'; }); render(); } });
+}
+function act(name, body){
+  body = body || {}; body.playerId = S.pid; body.name = S.name;
+  S.busy = true; S.msg = ''; render();
+  api(name, body).then(function(r){
+    S.busy = false;
+    if (!r || !r.ok) { S.msg = (r && r.error) || '操作失败'; render(); return; }
+    if (r.room) { S.room = r.room; S.invite = r.share || S.invite; S.view = 'room'; }
+    render();
+  });
+}
+function create(g, bot){ act('create', { game:g, withBot:!!bot }); }
+function quick(g){ act('quick', { game:g }); }
+function join(code){ act('join', { code:code }); }
+function move(m){ act('move', { code:S.room.code, move:m }); }
+function leave(){ act('leave', { code:S.room.code }); setTimeout(function(){ S.room=null; S.invite=null; S.view='lobby'; refreshRooms(); }, 300); }
+function saveName(){ const n = S.name.trim(); if (!n) return; S.name = n; try { localStorage.setItem('gamehub_name', n); } catch(e){} act('setName', { name:n }); S.msg = '昵称已保存'; render(); }
+
+function pollRoom(){
+  if (S.view !== 'room' || !S.room || S.room.status === 'finished') return;
+  api('room?code=' + S.room.code + '&playerId=' + S.pid).then(function(r){
+    if (r && r.ok && r.room) { S.room = r.room; S.invite = r.share || S.invite; render(); }
+  });
+}
+setInterval(pollRoom, 1500);
+
+function playerRow(p, i){
+  const score = S.room.scores ? (S.room.scores[p.id] || 0) : 0;
+  const me = p.id === S.pid ? ' me' : '';
+  const tag = p.isBot ? ' <span class="tag">AI</span>' : (p.id === S.pid ? ' <span class="tag">你</span>' : '');
+  return '<div class="player' + me + '"><span>' + esc(p.emoji || '') + ' ' + esc(p.name) + tag + '</span><span>得分 ' + score + '</span></div>';
+}
+
+function renderLobby(){
+  const games = S.games.map(function(g){
+    const extra = g.id === 'gongyu' ? ' · 4人同塘' : (g.kind === 'simultaneous' ? ' · 同时出招' : ' · 轮流落子');
+    return '<div class="game"><h3>' + g.icon + ' ' + esc(g.name) + '</h3><div class="desc">' + esc(g.desc) + extra + '</div>' +
+      '<div class="btns"><button class="btn" onclick="create(\'' + g.id + '\',false)">创建房间</button>' +
+      '<button class="btn ghost" onclick="quick(\'' + g.id + '\')">快速匹配</button>' +
+      '<button class="btn ghost" onclick="create(\'' + g.id + '\',true)">🤖 人机</button></div></div>';
+  }).join('');
+  const roomRows = S.rooms.map(function(r){
+    return '<div class="player"><span>' + r.gameIcon + ' ' + esc(r.gameName) + ' · ' + r.code + ' · 房主 ' + esc(r.players && r.players[0] ? r.players[0].name : '') + '</span>' +
+      '<button class="btn small" onclick="join(\'' + r.code + '\')">加入</button></div>';
+  }).join('') || '<div class="note">暂无等待中的房间</div>';
+  app.innerHTML = '<h1>🎮 博弈小屋</h1><div class="sub">博弈游戏大厅 · 房间号可任意形式分享</div>' +
+    '<div class="card"><div class="row"><input value="' + esc(S.name) + '" oninput="S.name=this.value" placeholder="昵称">' +
+    '<button class="btn small" onclick="saveName()">保存</button></div></div>' +
+    '<div class="card"><div class="row"><input value="' + esc(S.codeInput) + '" oninput="S.codeInput=this.value.toUpperCase()" placeholder="输入房间号加入" onkeydown="if(event.key===\'Enter\')join(S.codeInput.trim())">' +
+    '<button class="btn small" onclick="join(S.codeInput.trim())">加入房间</button></div></div>' +
+    games +
+    '<div class="sub">🕐 等待中的房间</div><div class="card">' + roomRows + '</div>' +
+    (S.msg ? '<div class="msg">' + esc(S.msg) + '</div>' : '');
+}
+
+function renderRoom(){
+  const r = S.room;
+  const chip = r.status === 'playing' ? '<span class="status on">对局中</span>' : r.status === 'finished' ? '<span class="status end">已结束</span>' : '<span class="status">等待中…</span>';
+  const players = (r.players || []).map(playerRow).join('');
+  let board = '';
+  if (r.kind === 'simultaneous'){
+    const canMove = r.status === 'playing' && !r.myMove && !S.busy;
+    const labels = r.moveLabels || {};
+    const btns = Object.keys(labels).map(function(k){ return '<button class="btn" ' + (canMove ? '' : 'disabled') + ' onclick="move(\'' + k + '\')">' + esc(labels[k]) + '</button>'; }).join('');
+    let wait = r.myMove ? (r.bothMoved ? '双方已出招 ✓' : '已出招，等待对手…') : (r.status === 'playing' ? (r.oppMoved ? '对手已出招，轮到你了！' : '请出招') : '');
+    let last = r.lastRound ? '<div class="log">第 ' + r.lastRound.round + ' 回合：' + r.lastRound.a + ' vs ' + r.lastRound.b + ' → ' + (r.lastRound.winner ? (r.lastRound.winner === S.pid ? '你赢了' : '对手赢了') : '平局') + '</div>' : '';
+    board = '<div class="moves">' + btns + '</div><div class="wait">' + wait + '</div>' + last +
+      (r.game === 'pd' ? '<div class="note">收益：合作+合作=3/3 · 你背叛=5/0 · 对方背叛你=0/5 · 都背叛=1/1（5回合）</div>' : '');
+  } else if (r.kind === 'turn' && r.board){
+    const myIdx = (r.players || []).findIndex(function(pl){ return pl.id === S.pid; });
+    const myTurn = r.turn === myIdx;
+    const cells = r.board.map(function(cell, i){
+      return '<button class="cell" ' + (r.status === 'playing' && myTurn && cell === null && !S.busy ? '' : 'disabled') + ' onclick="move(\'' + i + '\')">' + (cell || '') + '</button>';
+    }).join('');
+    board = '<div class="wait">' + (r.status === 'playing' ? (myTurn ? '轮到你落子（' + (myIdx === 0 ? 'X' : 'O') + '）' : '等待对手落子…') : '对局结束') + '</div><div class="board">' + cells + '</div>';
+  } else if (r.game === 'gongyu'){
+    const phase = r.phase || 'catch';
+    const myTurn = r.punishTurn === S.pid;
+    let phaseBox = '';
+    if (r.status === 'playing' && phase === 'catch'){
+      const can = !r.myCatch && !S.busy;
+      phaseBox = '<div class="wait">' + (r.myCatch ? '已下网，等待收网…' : '暗选捞几条（别人看不到）') + '</div>' +
+        '<div class="moves">' + [1,2,3].map(function(n){ return '<button class="btn" ' + (can ? '' : 'disabled') + ' onclick="move(\'' + n + '\')">捞 ' + n + ' 条 🐟</button>'; }).join('') + '</div>' +
+        '<div class="note">人均可持续 ≈1.5 条/轮 —— 但别人可不会这么想</div>';
+    } else if (r.status === 'playing' && phase === 'punish'){
+      const opts = (r.punishOptions || []).map(function(o){ return '<button class="btn" onclick="move(\'' + esc(o.id) + '\')">咬 ' + o.emoji + ' ' + esc(o.name) + '</button>'; }).join('');
+      phaseBox = '<div class="wait">' + (myTurn ? '轮到你：惩罚阶段（花1分扣3分）' : '等待 ' + esc(r.punishTurnName || '对手') + ' 决策…') + '</div>' +
+        (myTurn ? '<div class="moves">' + opts + '<button class="btn ghost" onclick="move(\'skip\')">忍了，跳过</button></div>' : '');
+    }
+    let finals = '';
+    if (r.finals){
+      const order = (r.players || []).map(function(_,i){ return i; }).sort(function(a,b){ return (r.finals[r.players[b].id]||0) - (r.finals[r.players[a].id]||0); });
+      const medals = ['🥇','🥈','🥉',''];
+      finals = '<div class="card">' + order.map(function(i,k){ return '<div class="player"><span class="medal">' + medals[k] + ' ' + esc(r.players[i].emoji||'') + ' ' + esc(r.players[i].name) + '</span><b>' + r.finals[r.players[i].id] + '</b></div>'; }).join('') + '</div>';
+    }
+    board = '<div class="card"><div class="pond">🐟 × <b>' + (r.pond||0) + '</b> <span style="font-size:12px;opacity:.7">/ 20</span></div>' +
+      '<div class="wait">第 ' + r.round + '/' + r.rounds + ' 轮 · ' + (r.collapsed ? '💀 鱼塘已枯竭' : (phase === 'catch' ? '捕鱼阶段' : '惩罚阶段')) + '</div></div>' + phaseBox + finals;
+  }
+  const log = (r.history || []).slice(-6).map(function(h){
+    if (r.game === 'gongyu') return '<div>第' + h.round + '轮：共捞 ' + h.total + ' 条 → 塘剩 ' + h.after + '×2' + ((h.punishes||[]).length ? ' · 咬人 ' + h.punishes.length + ' 次' : '') + '</div>';
+    if (r.game === 'pd'){
+      const isMe0 = (r.players||[])[0] && r.players[0].id === S.pid;
+      return '<div>第' + h.round + '轮：你 ' + (isMe0 ? h.a : h.b) + ' vs 对手 ' + (isMe0 ? h.b : h.a) + ' → 你 ' + (isMe0 ? h.p1 : h.p2) + ' / 对手 ' + (isMe0 ? h.p2 : h.p1) + '</div>';
+    }
+    return '';
+  }).join('') || '';
+  const win = r.status === 'finished' ? (function(){
+    if (!r.winner) return '<div class="win">平局！</div>';
+    const w = (r.players||[]).find(function(pl){ return pl.id === r.winner; });
+    return '<div class="win">' + esc(w ? w.name : '对手') + (w && w.id === S.pid ? '（你）' : '') + ' 获胜！🎉</div>';
+  })() : '';
+  app.innerHTML = '<h1>🎮 博弈小屋</h1><div class="sub">' + esc(r.gameIcon) + ' ' + esc(r.gameName) + ' · 房间号可分享</div>' +
+    '<div class="card"><div class="row"><b style="font-size:13px">房间</b>' + chip +
+    '<button class="btn small ghost" style="margin-left:auto" onclick="leave()">退出房间</button></div>' +
+    '<div class="code">' + r.code + '</div>' +
+    (S.invite && S.invite.text ? '<textarea rows="4" readonly onclick="this.select()">' + esc(S.invite.text) + '</textarea>' : '') +
+    '</div><div class="card">' + players + '</div>' + board + win +
+    (log ? '<div class="card log">' + log + '</div>' : '') +
+    (S.msg ? '<div class="msg">' + esc(S.msg) + '</div>' : '');
+}
+
+function render(){
+  if (S.busy && S.view === 'lobby') return;
+  if (S.view === 'room' && S.room) renderRoom(); else renderLobby();
+}
+init();
+</script>
+</body>
+</html>`
+
+    // ---------- model-visible tool ----------
     const agentId = 'agent-' + Math.random().toString(36).slice(2, 8)
     const gameTool = harness.defineTool({
       name: 'game_hub',
@@ -773,12 +1161,12 @@ return {
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['create', 'quick', 'join', 'list', 'state', 'move', 'share'], description: '操作：create 创建房间(可选 withBot)，quick 快速匹配，join 按房间号加入，list 列出所有房间，state 查看房间状态，move 落子，share 生成邀请文本' },
+          action: { type: 'string', enum: ['create', 'quick', 'join', 'list', 'state', 'move', 'share', 'peers'], description: '操作：create 创建房间(可选 withBot)，quick 快速匹配，join 按房间号加入，list 列出所有房间，state 查看房间状态，move 落子，share 生成邀请文本，peers 查看在线实例' },
           game: { type: 'string', enum: ['rps', 'pd', 'ttt', 'gongyu'], description: '游戏：rps=石头剪刀布, pd=囚徒困境, ttt=井字棋, gongyu=共鱼(4人鱼塘博弈)' },
-          code: { type: 'string', description: '房间号（join/state/move/share 需要）' },
+          code: { type: 'string', description: '房间号（join/state/move/share 需要，4位大写字母数字）' },
           move: { type: 'string', description: '落子：rps=rock/paper/scissors，pd=cooperate/defect，ttt=0-8 格编号，gongyu 捕鱼阶段=1/2/3、惩罚阶段=skip 或目标玩家id' },
           withBot: { type: 'boolean', description: '创建房间时是否带 AI 陪练（共鱼会补 3 个 AI，默认 false）' },
-          name: { type: 'string', description: '玩家昵称（默认 AI玩家）' }
+          name: { type: 'string', description: '玩家昵称（默认 AI玩家，最长16字符）' }
         },
         required: ['action']
       },
@@ -790,7 +1178,7 @@ return {
       },
       execute: async function (args) {
         const action = args && args.action
-        const player = { id: agentId, name: (args && args.name) || 'AI玩家' }
+        const player = { id: agentId, name: sanitizeName((args && args.name) || 'AI玩家') }
         try {
           if (action === 'create' || action === 'quick') {
             let out = null
@@ -802,10 +1190,12 @@ return {
             return { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
           }
           if (action === 'join') {
+            const code = sanitizeCode(args && args.code)
+            if (!code) return { ok: false, error: '房间号格式错误（4位大写字母数字）' }
             let out = null
             await mutateLobby(function (lobby) {
               lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
-              out = joinRoom(lobby, String((args && args.code) || '').toUpperCase(), player)
+              out = joinRoom(lobby, code, player)
             })
             if (!out || out.error) return { ok: false, error: (out && out.error) || '加入失败' }
             return { ok: true, code: out.room.code, room: roomView(out.room, player.id) }
@@ -817,23 +1207,30 @@ return {
               return { code: r.code, game: r.game, gameName: GAMES[r.game].name, status: r.status, players: r.players.map(function (p) { return { name: p.name, isBot: !!p.isBot } }) }
             }) }
           }
-          if (action === 'state') {
+          if (action === 'peers') {
             const lobby = await readLobby()
-            const room = lobby.rooms[String((args && args.code) || '').toUpperCase()]
+            return { ok: true, rooms: Object.keys(lobby.rooms).filter(function (code) { return lobby.rooms[code].status === 'waiting' }).map(function (code) { return { code: code, game: lobby.rooms[code].game } }) }
+          }
+          if (action === 'state') {
+            const code = sanitizeCode(args && args.code)
+            const lobby = await readLobby()
+            const room = lobby.rooms[code]
             if (!room) return { ok: false, error: '房间不存在' }
             return { ok: true, room: roomView(room, player.id) }
           }
           if (action === 'move') {
+            const code = sanitizeCode(args && args.code)
             let out = null
             await mutateLobby(function (lobby) {
-              out = applyPlayerMove(lobby, String((args && args.code) || '').toUpperCase(), player.id, args && args.move)
+              out = applyPlayerMove(lobby, code, player.id, args && args.move)
             })
             if (!out || out.error) return { ok: false, error: (out && out.error) || '落子失败' }
             return { ok: true, room: out.room }
           }
           if (action === 'share') {
+            const code = sanitizeCode(args && args.code)
             const lobby = await readLobby()
-            const room = lobby.rooms[String((args && args.code) || '').toUpperCase()]
+            const room = lobby.rooms[code]
             if (!room) return { ok: false, error: '房间不存在' }
             return { ok: true, share: sharePayload(room) }
           }
