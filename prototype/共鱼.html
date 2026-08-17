@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🐟 共鱼 · 鱼塘博弈实验室</title>
+<style>
+  * { box-sizing:border-box; margin:0; padding:0; -webkit-tap-highlight-color:transparent; }
+  body { font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+         background:linear-gradient(180deg,#0b2545,#134074); color:#eef4ed; min-height:100vh; }
+  .wrap { max-width:480px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; text-align:center; margin:6px 0 2px; }
+  .sub { text-align:center; opacity:.7; font-size:12px; margin-bottom:14px; }
+  .card { background:rgba(255,255,255,.08); border-radius:14px; padding:14px; margin-bottom:12px; }
+  .pond { display:flex; align-items:center; justify-content:center; gap:8px; font-size:18px; }
+  .pond b { font-size:40px; color:#f4a259; }
+  .info { text-align:center; font-size:14px; line-height:1.8; margin:8px 0; }
+  .big { font-size:18px; font-weight:700; }
+  .row { display:flex; gap:8px; margin-top:10px; }
+  .btn { flex:1; border:none; border-radius:10px; padding:12px 0; font-size:16px; font-weight:700;
+         cursor:pointer; background:#f4a259; color:#1a1a1a; }
+  .btn.ghost { background:rgba(255,255,255,.15); color:#eef4ed; }
+  .player { display:flex; align-items:center; justify-content:space-between; padding:8px 10px;
+            border-radius:10px; background:rgba(255,255,255,.07); margin-bottom:6px; font-size:14px; }
+  .player.me { outline:1px solid #f4a259; }
+  .tag { font-size:11px; background:rgba(255,255,255,.15); padding:2px 6px; border-radius:6px; }
+  .rev { display:flex; gap:10px; justify-content:center; font-size:22px; margin:6px 0; }
+  .rev span { min-width:60px; text-align:center; padding:8px 0; border-radius:8px;
+              background:rgba(255,255,255,.08); animation:pop .3s ease; }
+  @keyframes pop { from { transform:scale(.6); opacity:0; } }
+  .hint { text-align:center; font-size:12px; opacity:.6; margin-top:6px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; margin-top:8px; }
+  th,td { padding:5px 2px; text-align:center; }
+  th { opacity:.6; font-weight:400; }
+  .gold { color:#ffd166; } .silver { color:#c0c0c0; } .bronze { color:#cd7f32; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+"use strict";
+const CFG = { startFish:12, cap:20, rounds:6, minTake:1, maxTake:3, cost:1, dock:3 };
+const PERSONALITIES = {
+  nice:   { name:"老好人", emoji:"😇", desc:"只捞1条，从不惩罚，相信人性本善" },
+  greedy: { name:"贪婪鬼", emoji:"🦈", desc:"见鱼就捞3条，谁敢咬我我咬谁" },
+  grudge: { name:"记仇鬼", emoji:"🐙", desc:"盯住捞3条的人，花自己的鱼也要执法" },
+  random: { name:"疯鱼",   emoji:"🎲", desc:"全凭心情，不可预测" },
+};
+const PARTY_EMOJI = ["🐠","🐟","🦐","🐡"];
+const app = document.getElementById("app");
+let S = null, mode = "solo", entryIdx = 0, pIdx = 0;
+
+const el = h => { app.innerHTML = h; };
+const header = () => `<h1>🐟 共鱼</h1><div class="sub">鱼塘博弈实验室 · 公共地悲剧 × 囚徒困境 × 最后通牒</div>`;
+const score = p => p.catchTotal - p.spent - 3 * p.docked;
+const mkBot = b => ({ name:PERSONALITIES[b].name, emoji:PERSONALITIES[b].emoji, isBot:true, botType:b,
+                      catchTotal:0, spent:0, docked:0, lastCatch:0, punishTotal:0 });
+
+function scoreboard(){
+  const rows = S.players.map((p,i)=>
+    `<div class="player${i===0&&mode==="solo"?" me":""}"><span>${p.emoji} ${p.name}${p.isBot?` <span class="tag">AI</span>`:""}</span>` +
+    `<span>本轮 ${p.lastCatch?"🐟".repeat(p.lastCatch):"—"} · 分 ${score(p)}</span></div>`).join("");
+  return `<div class="card">${rows}</div>`;
+}
+
+// ---------- 设置 ----------
+function screenSetup(){
+  const botBtns = Object.keys(PERSONALITIES).map(b=>
+    `<label class="player" style="cursor:pointer"><span>${PERSONALITIES[b].emoji} ${PERSONALITIES[b].name} <span class="tag">AI</span><br><span style="font-size:11px;opacity:.7">${PERSONALITIES[b].desc}</span></span>` +
+    `<input type="checkbox" id="bot-${b}" ${b!=="random"?"checked":""}></label>`).join("");
+  el(`${header()}
+  <div class="card">
+    <div class="row">
+      <button class="btn ${mode==="solo"?"":""}" style="${mode==="solo"?"":"opacity:.5"}" onclick="setMode('solo')">🧑 单人挑战 AI</button>
+      <button class="btn" style="${mode==="party"?"":"opacity:.5"}" onclick="setMode('party')">👥 四人同桌</button>
+    </div>
+    ${mode==="solo"
+      ? `<div class="info" style="margin-top:10px">选你的 AI 对手：</div>${botBtns}`
+      : `<div class="info" style="margin-top:10px">四个人轮流用同一台手机，<br>选鱼时其他人请闭眼 🙈</div>`}
+    <div style="height:10px"></div>
+    <button class="btn" style="width:100%" onclick="startGame()">开始博弈 →</button>
+  </div>
+  <div class="card" style="font-size:12px;opacity:.85;line-height:1.9">
+    📖 规则：4 人共享鱼塘 ${CFG.startFish} 条。每轮暗选捞 1~3 条，捞完剩余鱼翻倍（上限 ${CFG.cap}）。<br>
+    惩罚阶段：可花自己 1 分，扣某人 3 分。<br>
+    打满 ${CFG.rounds} 轮比总分；鱼塘枯竭则全员收获减半。塘里剩鱼最后平分给大家。<br>
+    <b>三种原理</b>：公共地悲剧 · 囚徒困境 · 最后通牒心理
+  </div>`);
+}
+const setMode = m => { mode = m; screenSetup(); };
+
+function startGame(){
+  S = { round:1, pond:CFG.startFish, collapsed:false, history:[] };
+  if (mode === "solo") {
+    S.players = [{ name:"你", emoji:"🧑", isBot:false, botType:null, catchTotal:0, spent:0, docked:0, lastCatch:0, punishTotal:0 }];
+    const chosen = Object.keys(PERSONALITIES).filter(b => document.getElementById("bot-"+b)?.checked);
+    (chosen.length ? chosen : Object.keys(PERSONALITIES).slice(0,3)).forEach(b => S.players.push(mkBot(b)));
+  } else {
+    S.players = PARTY_EMOJI.map((e,i)=>({ name:"玩家"+(i+1), emoji:e, isBot:false, botType:null,
+      catchTotal:0, spent:0, docked:0, lastCatch:0, punishTotal:0 }));
+  }
+  screenEntry();
+}
+
+// ---------- 捕鱼阶段 ----------
+function screenEntry(){
+  if (mode === "solo") {
+    el(`${header()}
+    <div class="card">
+      <div class="pond">🐟 × <b>${S.pond}</b> <span style="font-size:12px;opacity:.7">/ ${CFG.cap}</span></div>
+      <div class="info big">第 ${S.round}/${CFG.rounds} 轮 · 你要捞几条？</div>
+      <div class="hint">人均可持续 ≈1.5 条/轮 —— 但别人可不会这么想</div>
+      <div class="row">${[1,2,3].map(n=>`<button class="btn" onclick="choose(${n})">捞 ${n} 条 🐟</button>`).join("")}</div>
+    </div>
+    ${scoreboard()}`);
+  } else {
+    entryIdx = 0; partyEntryStep();
+  }
+}
+function partyEntryStep(){
+  const p = S.players[entryIdx];
+  el(`${header()}
+  <div class="card">
+    <div class="pond">🐟 × <b>${S.pond}</b></div>
+    <div class="info big">第 ${S.round}/${CFG.rounds} 轮</div>
+    <div class="info">请把手机交给 <b>${p.emoji} ${p.name}</b><br><span style="opacity:.7">其他人请闭眼 / 转头 🙈</span></div>
+    <div class="row">${[1,2,3].map(n=>`<button class="btn" onclick="partyChoose(${n})">捞 ${n} 条</button>`).join("")}</div>
+  </div>`);
+}
+function partyChoose(n){
+  if (entryIdx >= S.players.length) return;               // 揭示已调度，忽略多余点击
+  if (S.players[entryIdx].choice != null) return;         // 同屏双击防护
+  S.players[entryIdx].choice = n; entryIdx++;
+  entryIdx < S.players.length ? partyEntryStep() : setTimeout(screenReveal, 400);
+}
+
+// ---------- AI 决策 ----------
+function decideTake(S, idx){
+  const p = S.players[idx], last = S.history[S.history.length-1];
+  const greedyCount = last ? last.catches.filter(c=>c===3).length : 0;
+  switch (p.botType) {
+    case "nice":   return S.pond >= 16 ? 2 : 1;
+    case "greedy": return S.pond < 3 ? 1 : 3;
+    case "grudge": return S.pond < 6 ? 1 : (greedyCount >= 1 ? 2 : 1);
+    default:       return 1 + Math.floor(Math.random()*3);
+  }
+}
+const BOT_PUNISH = {
+  nice:   () => null,
+  greedy: (S, idx, ctx) => ctx.dockers.length ? ctx.dockers[0] : null,
+  grudge: (S, idx, ctx) => ctx.greedy.length ? ctx.greedy[0] : (ctx.dockers.length ? ctx.dockers[0] : null),
+  random: (S, idx, ctx) => Math.random() < 0.25 ? ctx.others[Math.floor(Math.random()*ctx.others.length)] : null,
+};
+
+function choose(n){
+  if (S.players[0].choice != null) return;                // 双击防护
+  S.players[0].choice = n;
+  S.players.forEach((p,i)=>{ if (i>0) p.choice = decideTake(S,i); });
+  el(`${header()}<div class="card"><div class="info big">🎣 你下了网……</div><div class="info">水面很安静</div></div>`);
+  setTimeout(screenReveal, 800);
+}
+
+// ---------- 揭示 ----------
+function screenReveal(){
+  const total = S.players.reduce((a,p)=>a+(p.choice||0),0);
+  const after = S.pond - total, collapsed = after <= 0;
+  S.players.forEach(p=>{ p.lastCatch = p.choice||0; p.catchTotal += p.choice||0; p.choice = null; });
+  S.history.push({ round:S.round, catches:S.players.map(p=>p.lastCatch), punishes:[] });
+
+  let line;
+  if (collapsed) {
+    S.collapsed = true;
+    line = `<div class="info big" style="color:#ff6b6b">💀 鱼塘枯竭！</div>
+      <div class="info">共捞 ${total} 条，而塘里只有 ${S.pond} 条。<br>每个人的理性选择，一起杀死了鱼塘。<br><span style="opacity:.7">📖 公共地悲剧 · 游戏提前结束</span></div>
+      <button class="btn" style="width:100%" onclick="screenSettle()">查看结算 →</button>`;
+  } else {
+    const pond2 = Math.min(after*2, CFG.cap);
+    line = `<div class="info">共捞 ${total} 条 → 鱼塘 ${S.pond} - ${total} = ${after}，繁殖 ×2 → <b>${pond2}</b></div>
+      <button class="btn" style="width:100%" onclick="screenPunish()">进入惩罚阶段 →</button>`;
+    S.pond = pond2;
+  }
+  el(`${header()}
+  <div class="card">
+    <div class="info big">第 ${S.round} 轮 · 收网！</div>
+    <div class="rev">${S.players.map(p=>`<span>${p.emoji}<br>${"🐟".repeat(p.lastCatch)}</span>`).join("")}</div>
+    ${line}
+  </div>
+  ${scoreboard()}`);
+}
+
+// ---------- 惩罚阶段 ----------
+function screenPunish(){ if (S.inPunish) return; S.inPunish = true; pIdx = 0; punishStep(); }
+function punishStep(){
+  if (pIdx >= S.players.length) {
+    S.inPunish = false;
+    S.round++;
+    S.round > CFG.rounds ? screenSettle() : screenEntry();
+    return;
+  }
+  const p = S.players[pIdx];
+  const others = S.players.map((_,i)=>i).filter(i=>i!==pIdx);
+  const cur = S.history[S.history.length-1];
+  const ctx = {
+    dockers: cur.punishes.filter(x=>x.to===pIdx).map(x=>x.from),
+    greedy:  S.players.map((q,i)=>i).filter(i=>i!==pIdx && S.players[i].lastCatch===3),
+    others,
+  };
+  if (p.isBot) {
+    const t = BOT_PUNISH[p.botType](S, pIdx, ctx);
+    if (t != null) applyPunish(pIdx, t);
+    pIdx++;
+    setTimeout(punishStep, 600);
+    return;
+  }
+  S.punishDone = false;
+  el(`${header()}
+  <div class="card">
+    <div class="info big">惩罚阶段 · ${p.emoji} ${p.name}</div>
+    <div class="info">花自己 <b>1 分</b>，扣某人 <b>3 分</b>？<br><span style="opacity:.7">你的当前分数：${score(p)}（允许变成负数）</span></div>
+    <div class="row" style="flex-wrap:wrap">${ctx.others.map(i=>`<button class="btn" style="flex:1 1 45%" onclick="doPunish(${pIdx},${i})">咬 ${S.players[i].emoji} ${S.players[i].name}</button>`).join("")}</div>
+    <button class="btn ghost" style="width:100%;margin-top:8px" onclick="skipPunish()">忍了，跳过</button>
+  </div>`);
+}
+function applyPunish(from, to){
+  S.players[from].spent += CFG.cost;
+  S.players[to].docked += CFG.dock;
+  S.players[from].punishTotal++;
+  S.history[S.history.length-1].punishes.push({ from, to });
+}
+function doPunish(from, to){
+  if (S.punishDone) return;                               // 双击防护
+  S.punishDone = true;
+  applyPunish(from, to); pIdx++; punishStep();
+}
+function skipPunish(){
+  if (S.punishDone) return;
+  S.punishDone = true;
+  pIdx++; punishStep();
+}
+
+// ---------- 结算与行为报告 ----------
+function screenSettle(){
+  const played = S.history.length;
+  const finals = S.players.map(p => {
+    let f = S.collapsed ? Math.floor(p.catchTotal/2) : p.catchTotal + Math.round(S.pond/S.players.length*10)/10;
+    f -= p.spent + 3*p.docked;
+    return f;
+  });
+  const order = S.players.map((_,i)=>i).sort((a,b)=>finals[b]-finals[a]);
+  const medal = ["🥇","🥈","🥉",""];
+  const rows = order.map((i,k)=>
+    `<div class="player${i===0&&mode==="solo"?" me":""}"><span>${medal[k]} ${S.players[i].emoji} ${S.players[i].name}</span><b>${finals[i]}</b></div>`).join("");
+  const rep = S.players.map((p,i)=>reportLine(p,i,played)).join("");
+  el(`${header()}
+  <div class="card">
+    <div class="info big">🏁 博弈结束</div>
+    ${S.collapsed ? `<div class="info" style="color:#ff6b6b">鱼塘枯竭：全员捕捞数减半，且无分红</div>`
+                  : `<div class="info">鱼塘存活：塘中 ${S.pond} 条，每人分红 +${Math.round(S.pond/S.players.length*10)/10}</div>`}
+    ${rows}
+  </div>
+  <div class="card report">
+    <div class="info big" style="text-align:left">🧠 行为报告</div>
+    ${rep}
+  </div>
+  <button class="btn" style="width:100%" onclick="screenSetup()">再来一局</button>`);
+}
+function reportLine(p, idx, played){
+  let ret = 0, opp = 0;
+  for (let r = 0; r < S.history.length-1; r++) {
+    const dockedBy = S.history[r].punishes.filter(x=>x.to===idx).map(x=>x.from);
+    if (!dockedBy.length) continue;
+    opp++;
+    const nxt = S.history[r+1].punishes.filter(x=>x.from===idx);
+    if (nxt.some(x=>dockedBy.includes(x.to))) ret++;
+  }
+  const avg = Math.round(p.catchTotal/played*10)/10;
+  const retRate = opp ? Math.round(ret/opp*100) : 0;
+  let verdict;
+  if (S.collapsed && avg >= 2.4) verdict = "🐺 推手之一：你亲手把鱼塘推向枯竭——贪婪的代价是所有人都没鱼吃。";
+  else if (p.punishTotal >= 2 && retRate >= 50) verdict = "⚖️ 以牙还牙的执法者：你用惩罚维持秩序——事实上它确实管用。";
+  else if (p.punishTotal >= 2) verdict = "🛡️ 正义使者：眼里揉不得沙子，愿意自掏腰包维护公平。";
+  else if (p.punishTotal === 0 && avg <= 1.5) verdict = "🕊️ 老好人：你的克制值得敬佩，但要小心别人正靠你的克制发大财。";
+  else if (avg >= 2.4) verdict = "🦈 机会主义者：你只算自己的账。如果人人都像你，鱼塘一轮就没了。";
+  else verdict = "🧭 务实玩家：你在自私与合作之间找平衡。";
+  return `<div class="player"><span>${p.emoji} ${p.name}</span><span class="tag">均捞 ${avg} · 罚 ${p.punishTotal} · 报复率 ${retRate}%</span></div>
+          <div style="font-size:13px;opacity:.9;line-height:1.7;margin-bottom:10px">${verdict}</div>`;
+}
+
+screenSetup();
+</script>
+</body>
+</html>
