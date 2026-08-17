@@ -86,7 +86,9 @@ return {
       const now = Date.now()
       for (const code of Object.keys(lobby.rooms)) {
         const r = lobby.rooms[code]
-        if (now - (r.updatedAt || 0) > 45 * 60 * 1000) delete lobby.rooms[code]
+        // 已结束的对局 5 分钟内清理；等待/进行中 45 分钟
+        const ttl = r.status === 'finished' ? 5 * 60 * 1000 : 45 * 60 * 1000
+        if (now - (r.updatedAt || 0) > ttl) delete lobby.rooms[code]
       }
     }
 
@@ -581,7 +583,9 @@ return {
       if (!room) return { ok: true }
       const idx = room.players.findIndex(function (p) { return p.id === playerId })
       if (idx >= 0) room.players.splice(idx, 1)
-      if (room.players.length === 0) {
+      // 没有真人玩家了（空房或只剩 AI）→ 彻底删除，不再出现在任何列表
+      const hasHuman = room.players.some(function (p) { return !p.isBot })
+      if (!hasHuman) {
         delete lobby.rooms[code]
         return { ok: true }
       }
