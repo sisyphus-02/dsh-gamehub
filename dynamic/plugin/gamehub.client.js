@@ -48,8 +48,8 @@ return {
 .gh-overlay .gh-root{max-width:100%}
 `)
 
-    // 弹窗开关状态（侧栏按钮 ↔ 浮层面板共享）
-    const bus = { open: false, subs: [] }
+    // 弹窗开关状态 + 稳定会话身份（侧栏按钮 ↔ 浮层面板共享；卡片提供 sessionId）
+    const bus = { open: false, sessionId: null, subs: [] }
     function setOverlay(open) {
       bus.open = !!open
       bus.subs.forEach(function (fn) { fn(bus.open) })
@@ -92,15 +92,18 @@ return {
             React.createElement('span', null, '🎮 博弈小屋'),
             React.createElement('button', { className: 'gh-overlay-close', onClick: function () { setOverlay(false) } }, '✕')
           ),
-          React.createElement(GameHub, { ctx: ctx, sessionId: null })
+          React.createElement(GameHub, { ctx: ctx, sessionId: bus.sessionId })
         )
       }
     ))
 
-    // 运行卡片内的界面（保留）
+    // 运行卡片内的界面：提供稳定 sessionId 存入 bus，供浮层复用
     slots.inject('tool.view.cordis', () => slots.register(
       { name: 'tool.view.cordis', key: 'self' },
-      (props) => React.createElement(GameHub, { ctx: ctx, sessionId: props.sessionId })
+      (props) => {
+        if (props.sessionId) bus.sessionId = props.sessionId
+        return React.createElement(GameHub, { ctx: ctx, sessionId: props.sessionId })
+      }
     ))
 
     function GameHub(props) {
