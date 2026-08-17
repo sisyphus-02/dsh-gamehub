@@ -1,13 +1,22 @@
-// 博弈小屋 GameHub · preset 版插件（普通 Cordis 插件环境）
-// 每个会话挂载一次：注册 game_hub 工具 + 只读 HTTP 发现/大厅 API + 本机共享大厅引擎。
-// 安全设计：HTTP 接口全部只读；房间号/昵称严格限长与字符集；大厅文件仅写 /tmp 白名单路径；
-//           实例发现只暴露公开元数据，不暴露文件路径/环境变量/会话信息。
+// 博弈小屋 GameHub · preset 版插件（普通 Cordis 插件环境）· 支持局域网 P2P
+// 每个会话挂载一次：注册 game_hub 工具 + HTTP 大厅/发现 API + 本机共享大厅引擎。
+// 局域网 P2P：UDP 组播发现在线实例（239.255.77.77:45777），每个实例开一个局域网 HTTP
+//             对等端口，互相拉取/同步大厅、直接转发加入与落子。跨机器对局零中心。
+// 安全设计：对等 HTTP 只暴露白名单房间 API（列表/加入/落子/退出），全部输入校验；
+//           大厅文件仅写 /tmp 白名单路径；发现广播只含实例 id/昵称/端口，不含路径与环境信息；
+//           不做任何代码执行、不读任意文件、不暴露环境变量。
 'use strict'
 const LOBBY_NAME = 'dsh-gamehub-lobby.json'
 const LOBBY_CANDIDATES = ['/tmp/' + LOBBY_NAME, '/tmp/dsh-gamehub/' + LOBBY_NAME]
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'
 const NAME_MAX = 16
 const CODE_RE = /^[A-Z0-9]{4}$/
+
+// 局域网 P2P 常量
+const P2P_MCAST_GROUP = '239.255.77.77'
+const P2P_MCAST_PORT = 45777
+const P2P_INTERVAL_MS = 10000   // 广播/清理周期
+const P2P_PEER_TTL_MS = 30000   // 实例 30s 无心跳则视为离线
 
 module.exports = {
   inject: ['timer'],
@@ -618,40 +627,311 @@ module.exports = {
       return { id: pid || ('u-' + Math.random().toString(36).slice(2, 8)), name: sanitizeName(args && args.name) }
     }
 
-    // ---------- 实例发现：向其他同样在线的实例广播公开元数据 ----------
-    // 只暴露：实例身份(短随机id)、昵称、当前等待房间数与游戏列表。绝不暴露路径/环境/会话信息。
-    function publicPeerMeta() {
-      return {
-        id: peerId,
-        kind: 'gamehub',
-        name: peerName,
-        since: peerSince,
-        waitingRooms: peerRoomCount()
+    // ---------- 局域网 P2P：UDP 组播发现 + 对等 HTTP ----------
+    // 依赖 node:dgram / node:http（preset 环境可用；动态插件沙箱不可用，所以 P2P 在 preset 版）
+    let p2p = null
+    try {
+      const dgram = require('node:dgram')
+      const http = require('node:http')
+      const os = require('node:os')
+
+      // 本机局域网地址（排除回环）
+      function lanAddress() {
+        try {
+          const ifaces = os.networkInterfaces()
+          for (const name of Object.keys(ifaces)) {
+            for (const info of ifaces[name] || []) {
+              if (info.family === 'IPv4' && !info.internal) return info.address
+            }
+          }
+        } catch (e) { /* ignore */ }
+        return '127.0.0.1'
       }
+
+      // 实例身份：只广播公开元数据
+      const peerId = 'gh-' + Math.random().toString(36).slice(2, 10)
+      let peerName = '博弈小屋'
+      const peers = {} // id -> { id, name, addr, port, lastSeen }
+      let peerServer = null
+      let peerPort = 0
+      const lanIp = lanAddress()
+
+      function peerUrl(peer) {
+        return 'http://' + peer.addr + ':' + peer.port
+      }
+
+      // 对等 HTTP 白名单 API：lobby / peers / room / join / move / leave
+      function peerHandler(req, res) {
+        const respond = function (data, status) {
+          res.writeHead(status || 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(JSON.stringify(data))
+        }
+        let path = ''
+        try { path = String(req.url || '').split('?')[0] } catch (e) { path = '' }
+        const method = req.method || 'GET'
+
+        if (path === '/api/peer/ping') {
+          respond({ ok: true, id: peerId, name: peerName, kind: 'gamehub' })
+          return
+        }
+        if (path === '/api/peer/lobby' && method === 'GET') {
+          readLobby().then(function (lobby) {
+            const rooms = Object.keys(lobby.rooms)
+              .filter(function (code) { return lobby.rooms[code].status === 'waiting' })
+              .map(function (code) {
+                const r = lobby.rooms[code]
+                return { code: r.code, game: r.game, gameName: GAMES[r.game].name, gameIcon: GAMES[r.game].icon, host: r.players[0] ? r.players[0].name : '' }
+              })
+            respond({ ok: true, id: peerId, name: peerName, rooms: rooms })
+          }).catch(function () { respond({ ok: false, error: 'lobby read failed' }, 500) })
+          return
+        }
+        if (path === '/api/peer/room' && method === 'GET') {
+          let code = ''
+          try { code = String((req.url || '').split('?')[1] || '').split('&').map(function (p) { return p.split('=') }).filter(function (kv) { return kv[0] === 'code' }).map(function (kv) { return kv[1] }).join('') } catch (e) { code = '' }
+          code = code.toUpperCase()
+          if (!CODE_RE.test(code)) return respond({ ok: false, error: '房间号格式错误' }, 400)
+          readLobby().then(function (lobby) {
+            const room = lobby.rooms[code]
+            if (!room) return respond({ ok: false, error: '房间不存在' }, 404)
+            respond({ ok: true, room: roomView(room, null) })
+          }).catch(function () { respond({ ok: false, error: 'read failed' }, 500) })
+          return
+        }
+        if (path === '/api/peer/join' && method === 'POST') {
+          let body = ''
+          req.on('data', function (c) { body += c; if (body.length > 4096) req.destroy() })
+          req.on('end', function () {
+            let args = {}
+            try { args = JSON.parse(body || '{}') } catch (e) { args = {} }
+            const code = sanitizeCode(args.code)
+            if (!code) return respond({ ok: false, error: '房间号格式错误' }, 400)
+            const player = playerOf(args)
+            mutateLobby(function (lobby) {
+              lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+              const out = joinRoom(lobby, code, player)
+              if (out.error) return respond({ ok: false, error: out.error }, 400)
+              respond({ ok: true, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+            })
+          })
+          req.on('error', function () { respond({ ok: false, error: 'bad request' }, 400) })
+          return
+        }
+        if (path === '/api/peer/move' && method === 'POST') {
+          let body = ''
+          req.on('data', function (c) { body += c; if (body.length > 4096) req.destroy() })
+          req.on('end', function () {
+            let args = {}
+            try { args = JSON.parse(body || '{}') } catch (e) { args = {} }
+            const code = sanitizeCode(args.code)
+            const pid = sanitizePlayerId(args.playerId)
+            if (!code || !pid) return respond({ ok: false, error: '参数错误' }, 400)
+            mutateLobby(function (lobby) {
+              const out = applyPlayerMove(lobby, code, pid, args.move)
+              if (!out.ok) return respond({ ok: false, error: out.error || '落子失败' }, 400)
+              respond({ ok: true, room: out.room })
+            })
+          })
+          req.on('error', function () { respond({ ok: false, error: 'bad request' }, 400) })
+          return
+        }
+        if (path === '/api/peer/leave' && method === 'POST') {
+          let body = ''
+          req.on('data', function (c) { body += c; if (body.length > 4096) req.destroy() })
+          req.on('end', function () {
+            let args = {}
+            try { args = JSON.parse(body || '{}') } catch (e) { args = {} }
+            const code = sanitizeCode(args.code)
+            const pid = sanitizePlayerId(args.playerId)
+            mutateLobby(function (lobby) { leaveRoom(lobby, code, pid) })
+            respond({ ok: true })
+          })
+          req.on('error', function () { respond({ ok: false, error: 'bad request' }, 400) })
+          return
+        }
+        respond({ ok: false, error: 'not found' }, 404)
+      }
+
+      // UDP 组播发现
+      const udp = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+      udp.on('message', function (msg, rinfo) {
+        try {
+          const data = JSON.parse(msg.toString())
+          if (data && data.kind === 'gamehub' && data.id && data.id !== peerId) {
+            peers[data.id] = { id: data.id, name: sanitizeName(data.name), addr: rinfo.address, port: Number(data.port) || 0, lastSeen: Date.now() }
+          }
+        } catch (e) { /* 非本协议报文忽略 */ }
+      })
+      udp.bind(P2P_MCAST_PORT, function () {
+        try { udp.addMembership(P2P_MCAST_GROUP) } catch (e) { /* 单机/无组播环境忽略 */ }
+        udp.setMulticastTTL(1)
+        udp.setBroadcast(true)
+      })
+
+      // 周期广播 + 清理离线实例
+      const announce = function () {
+        try {
+          const payload = Buffer.from(JSON.stringify({ kind: 'gamehub', id: peerId, name: peerName, port: peerPort }))
+          udp.send(payload, P2P_MCAST_PORT, P2P_MCAST_GROUP)
+          const now = Date.now()
+          for (const id of Object.keys(peers)) {
+            if (now - peers[id].lastSeen > P2P_PEER_TTL_MS) delete peers[id]
+          }
+        } catch (e) { /* ignore */ }
+      }
+      const announceTimer = timer.interval(announce, P2P_INTERVAL_MS)
+
+      // 启动对等 HTTP 服务器（监听局域网地址）
+      peerServer = http.createServer(peerHandler)
+      peerServer.listen(0, lanIp, function () {
+        peerPort = peerServer.address().port
+        // 启动后立刻广播一次
+        try {
+          const payload = Buffer.from(JSON.stringify({ kind: 'gamehub', id: peerId, name: peerName, port: peerPort }))
+          udp.send(payload, P2P_MCAST_PORT, P2P_MCAST_GROUP)
+        } catch (e) { /* ignore */ }
+      })
+
+      // 远程操作封装：把 code 不在本地时转发给持有它的在线实例
+      async function remoteFind(code) {
+        for (const id of Object.keys(peers)) {
+          const p = peers[id]
+          if (!p.port) continue
+          try {
+            const url = peerUrl(p) + '/api/peer/lobby'
+            const res = await httpGetJson(url, null, 2500)
+            if (res && res.ok && res.rooms && res.rooms.some(function (r) { return r.code === code })) {
+              return p
+            }
+          } catch (e) { /* 实例不可达忽略 */ }
+        }
+        return null
+      }
+      function httpGetJson(url, body, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+          const u = new URL(url)
+          const opts = {
+            hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: body ? 'POST' : 'GET',
+            timeout: timeoutMs || 2500, headers: { 'content-type': 'application/json' }
+          }
+          const req = http.request(opts, function (res) {
+            let data = ''
+            res.on('data', function (c) { data += c })
+            res.on('end', function () {
+              try { resolve(JSON.parse(data || '{}')) } catch (e) { reject(new Error('bad json')) }
+            })
+          })
+          req.on('timeout', function () { req.destroy(); reject(new Error('timeout')) })
+          req.on('error', reject)
+          if (body) req.write(JSON.stringify(body))
+          req.end()
+        })
+      }
+
+      p2p = {
+        id: peerId,
+        name: function () { return peerName },
+        setName: function (n) { peerName = sanitizeName(n) },
+        lanIp: lanIp,
+        port: function () { return peerPort },
+        peers: function () {
+          const now = Date.now()
+          return Object.keys(peers).map(function (id) {
+            const p = peers[id]
+            return { id: p.id, name: p.name, addr: p.addr, port: p.port, lastSeen: now - p.lastSeen }
+          })
+        },
+        // 从在线实例拉取等待房间（并发）
+        remoteRooms: async function () {
+          const out = []
+          const list = Object.keys(peers).map(function (id) { return peers[id] }).filter(function (p) { return p.port })
+          await Promise.all(list.map(async function (p) {
+            try {
+              const res = await httpGetJson(peerUrl(p) + '/api/peer/lobby', null, 2000)
+              if (res && res.ok && res.rooms) {
+                out.push({ peer: { id: p.id, name: p.name, addr: p.addr, port: p.port }, rooms: res.rooms })
+              }
+            } catch (e) { /* 不可达忽略 */ }
+          }))
+          return out
+        },
+        // 加入远程房间：按 code 找到持有实例并转发
+        remoteJoin: async function (code, player) {
+          const peer = await remoteFind(code)
+          if (!peer) return { error: '远程房间不存在或不可达' }
+          try {
+            const res = await httpGetJson(peerUrl(peer) + '/api/peer/join', { code: code, playerId: player.id, name: player.name }, 3000)
+            return res || { error: '无响应' }
+          } catch (e) {
+            return { error: '远程实例不可达: ' + String(e && e.message || e) }
+          }
+        },
+        // 远程落子
+        remoteMove: async function (code, playerId, move) {
+          const peer = await remoteFind(code)
+          if (!peer) return { error: '远程房间不存在或不可达' }
+          try {
+            const res = await httpGetJson(peerUrl(peer) + '/api/peer/move', { code: code, playerId: playerId, move: move }, 3000)
+            return res || { error: '无响应' }
+          } catch (e) {
+            return { error: '远程实例不可达: ' + String(e && e.message || e) }
+          }
+        },
+        // 远程退出
+        remoteLeave: async function (code, playerId) {
+          const peer = await remoteFind(code)
+          if (!peer) return { ok: true }
+          try {
+            await httpGetJson(peerUrl(peer) + '/api/peer/leave', { code: code, playerId: playerId }, 3000)
+          } catch (e) { /* ignore */ }
+          return { ok: true }
+        },
+        dispose: function () {
+          try { announceTimer() } catch (e) { /* ignore */ }
+          try { udp.close() } catch (e) { /* ignore */ }
+          try { peerServer.close() } catch (e) { /* ignore */ }
+        }
+      }
+    } catch (e) {
+      console.log('gamehub: P2P 不可用（' + String(e && e.message || e) + '）')
+      p2p = null
     }
-    const peerId = 'gh-' + Math.random().toString(36).slice(2, 10)
-    let peerName = '博弈小屋'
-    let peerSince = Date.now()
-    function peerRoomCount() {
-      // 在每次调用时快速统计等待房间数（不写文件）
-      return 0 // 占位：由大厅读取替代（见 /api/gamehub/lobby）
+    if (p2p) {
+      ctx.effect(function () {
+        return p2p.dispose
+      })
     }
 
-    // ---------- HTTP 只读发现 API ----------
+    // ---------- HTTP API（只读 + 可写，全部校验） ----------
     if (webServer) {
       const respondJson = function (res, data, status) {
-        res.writeHead(status || 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+        res.writeHead(status || 200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*' })
         res.end(JSON.stringify(data))
       }
-      const parseCode = function (req) {
+      const parseQuery = function (req) {
         const raw = String(req.url || '')
         const qi = raw.indexOf('?')
         const qs = qi >= 0 ? raw.slice(qi + 1) : ''
-        const parts = qs.split('&')
-        for (const part of parts) {
-          if (part.indexOf('code=') === 0) return part.slice(5).toUpperCase()
-        }
-        return ''
+        const out = {}
+        qs.split('&').forEach(function (part) {
+          const eq = part.indexOf('=')
+          if (eq <= 0) return
+          out[part.slice(0, eq)] = part.slice(eq + 1)
+        })
+        return out
+      }
+      const readBody = function (req) {
+        return new Promise(function (resolve) {
+          let data = ''
+          req.on('data', function (c) {
+            data += c
+            if (data.length > 65536) { req.destroy(); resolve({}) }
+          })
+          req.on('end', function () {
+            try { resolve(JSON.parse(data || '{}')) } catch (e) { resolve({}) }
+          })
+          req.on('error', function () { resolve({}) })
+        })
       }
       try {
         const exact = webServer.exact
@@ -659,10 +939,28 @@ module.exports = {
           exact.delete('/api/gamehub/lobby')
           exact.delete('/api/gamehub/room')
           exact.delete('/api/gamehub/peers')
+          exact.delete('/api/gamehub/create')
+          exact.delete('/api/gamehub/join')
+          exact.delete('/api/gamehub/quick')
+          exact.delete('/api/gamehub/move')
+          exact.delete('/api/gamehub/leave')
+          exact.delete('/api/gamehub/games')
+          exact.delete('/api/gamehub/share')
         }
       } catch (e) { /* ignore */ }
 
-      // 大厅：所有等待中房间（只读）
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/games',
+        handler: function (req, res) {
+          respondJson(res, { ok: true, games: Object.keys(GAMES).map(function (id) {
+            const g = GAMES[id]
+            return { id: id, name: g.name, icon: g.icon, desc: g.desc, kind: g.kind, rounds: g.rounds, maxPlayers: g.maxPlayers, moveLabels: g.moveLabels }
+          }) })
+        }
+      }))
+
+      // 大厅：本地等待房间 + 远程实例的等待房间
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/api/gamehub/lobby',
@@ -672,48 +970,313 @@ module.exports = {
             const r = lobby.rooms[code]
             return { code: r.code, game: r.game, gameName: GAMES[r.game].name, gameIcon: GAMES[r.game].icon, status: r.status, players: r.players.map(function (p) { return { name: p.name, isBot: !!p.isBot } }) }
           })
-          respondJson(res, { ok: true, rooms: rooms })
+          let remote = []
+          if (p2p) {
+            try { remote = await p2p.remoteRooms() } catch (e) { remote = [] }
+          }
+          respondJson(res, { ok: true, rooms: rooms, remotePeers: remote })
         }
       }))
 
-      // 房间详情（只读）
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/api/gamehub/room',
         handler: async function (req, res) {
-          const code = parseCode(req)
+          const q = parseQuery(req)
+          const code = String(q.code || '').toUpperCase()
           if (!CODE_RE.test(code)) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
           const lobby = await readLobby()
           const room = lobby.rooms[code]
           if (!room) return respondJson(res, { ok: false, error: '房间不存在' }, 404)
-          respondJson(res, { ok: true, room: roomView(room, null), share: sharePayload(room) })
+          respondJson(res, { ok: true, room: roomView(room, sanitizePlayerId(q.playerId) || null), share: sharePayload(room) })
         }
       }))
 
-      // 在线实例发现：返回本机大厅里的等待房间（供其他实例/用户发现）
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/share',
+        handler: async function (req, res) {
+          const q = parseQuery(req)
+          const code = String(q.code || '').toUpperCase()
+          if (!CODE_RE.test(code)) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const lobby = await readLobby()
+          const room = lobby.rooms[code]
+          if (!room) return respondJson(res, { ok: false, error: '房间不存在' }, 404)
+          respondJson(res, { ok: true, share: sharePayload(room) })
+        }
+      }))
+
+      // 在线实例发现：本地实例信息 + 发现的 peers
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/api/gamehub/peers',
         handler: async function (req, res) {
-          const lobby = await readLobby()
-          const waiting = Object.keys(lobby.rooms)
-            .map(function (code) { return lobby.rooms[code] })
-            .filter(function (r) { return r.status === 'waiting' })
-            .map(function (r) { return { code: r.code, game: r.game, gameName: GAMES[r.game].name, host: r.players[0] ? r.players[0].name : '' } })
-          respondJson(res, { ok: true, peer: publicPeerMeta(), waiting: waiting })
+          const self = p2p ? { id: p2p.id, name: p2p.name(), addr: p2p.lanIp, port: p2p.port(), local: true } : null
+          const peerList = p2p ? p2p.peers() : []
+          respondJson(res, { ok: true, self: self, peers: peerList })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/create',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const gameId = GAMES[body && body.game] ? body.game : ''
+          if (!gameId) return respondJson(res, { ok: false, error: '未知游戏' }, 400)
+          const player = playerOf(body)
+          const withBot = !!(body && body.withBot)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = createRoom(lobby, gameId, player, withBot)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '创建失败' }, 400)
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/join',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          if (!code) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const player = playerOf(body)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = joinRoom(lobby, code, player)
+          })
+          if (!out || out.error) {
+            // 本地没有 → 尝试远程实例
+            if (p2p && out && out.error === '房间不存在或已过期') {
+              const remote = await p2p.remoteJoin(code, player)
+              if (remote && remote.ok) return respondJson(res, remote)
+              if (remote && remote.error) return respondJson(res, { ok: false, error: remote.error }, 404)
+            }
+            return respondJson(res, { ok: false, error: (out && out.error) || '加入失败' }, 400)
+          }
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/quick',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const gameId = GAMES[body && body.game] ? body.game : ''
+          if (!gameId) return respondJson(res, { ok: false, error: '未知游戏' }, 400)
+          const player = playerOf(body)
+          let out = null
+          await mutateLobby(function (lobby) {
+            lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+            out = quickMatch(lobby, gameId, player)
+          })
+          if (!out || out.error) return respondJson(res, { ok: false, error: (out && out.error) || '匹配失败' }, 400)
+          respondJson(res, { ok: true, code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/move',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          if (!code) return respondJson(res, { ok: false, error: '房间号格式错误' }, 400)
+          const pid = sanitizePlayerId(body && body.playerId)
+          if (!pid) return respondJson(res, { ok: false, error: '缺少玩家身份' }, 400)
+          let out = null
+          await mutateLobby(function (lobby) {
+            out = applyPlayerMove(lobby, code, pid, body && body.move)
+          })
+          if (!out || out.error) {
+            if (p2p && out && out.error === '房间不存在或已过期') {
+              const remote = await p2p.remoteMove(code, pid, body && body.move)
+              if (remote && remote.ok) return respondJson(res, remote)
+              if (remote && remote.error) return respondJson(res, { ok: false, error: remote.error }, 404)
+            }
+            return respondJson(res, { ok: false, error: (out && out.error) || '落子失败' }, 400)
+          }
+          respondJson(res, { ok: true, room: out.room })
+        }
+      }))
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/leave',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const code = sanitizeCode(body && body.code)
+          const pid = sanitizePlayerId(body && body.playerId)
+          if (p2p && !(await readLobby()).rooms[code]) {
+            await p2p.remoteLeave(code, pid)
+            return respondJson(res, { ok: true })
+          }
+          await mutateLobby(function (lobby) { leaveRoom(lobby, code, pid) })
+          respondJson(res, { ok: true })
         }
       }))
     }
 
-    // ---------- game_hub 模型工具 ----------
+    // ---------- Client RPC ----------
+    harness.handle('identify', async function (args) {
+      const sid = (args && args.sessionId) || null
+      const playerId = sid ? 'u-' + String(sid).replace(/[^a-zA-Z0-9_-]/g, '').slice(-28) : 'u-' + Math.random().toString(36).slice(2, 10)
+      let name = ''
+      await mutateLobby(function (lobby) {
+        const p = getPlayer(lobby, playerId)
+        name = p.name
+      })
+      return { playerId: playerId, name: name }
+    })
+
+    harness.handle('page-url', async function () {
+      let url = ''
+      try { if (webServer && webServer.port) url = 'http://127.0.0.1:' + webServer.port + '/gamehub' } catch (e) { url = '' }
+      return { url: url }
+    })
+
+    harness.handle('set-name', async function (args) {
+      const pid = args && args.playerId
+      const nm = sanitizeName((args && args.name) || '玩家')
+      if (!pid) return { error: '缺少 playerId' }
+      await mutateLobby(function (lobby) {
+        lobby.players[pid] = { name: nm, updatedAt: Date.now() }
+      })
+      return { ok: true, name: nm }
+    })
+
+    harness.handle('games', async function () {
+      return Object.keys(GAMES).map(function (id) {
+        const g = GAMES[id]
+        return { id: id, name: g.name, icon: g.icon, desc: g.desc, kind: g.kind, rounds: g.rounds, maxPlayers: g.maxPlayers, moveLabels: g.moveLabels }
+      })
+    })
+
+    harness.handle('create', async function (args) {
+      const player = playerOf(args)
+      const withBot = !!(args && args.withBot)
+      let out = null
+      await mutateLobby(function (lobby) {
+        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+        out = createRoom(lobby, args && args.game, player, withBot)
+        if (!out.error) out.room.updatedAt = Date.now()
+      })
+      if (out.error) return out
+      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
+    })
+
+    harness.handle('quick', async function (args) {
+      const player = playerOf(args)
+      let out = null
+      await mutateLobby(function (lobby) {
+        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+        out = quickMatch(lobby, args && args.game, player)
+      })
+      if (out.error) return out
+      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
+    })
+
+    harness.handle('join', async function (args) {
+      const player = playerOf(args)
+      const code = sanitizeCode(args && args.code)
+      if (!code) return { error: '请输入房间号' }
+      let out = null
+      await mutateLobby(function (lobby) {
+        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
+        out = joinRoom(lobby, code, player)
+      })
+      if (out.error) {
+        if (p2p && out.error === '房间不存在或已过期') {
+          const remote = await p2p.remoteJoin(code, player)
+          if (remote && remote.ok) return { code: code, room: remote.room, share: remote.share }
+          if (remote && remote.error) return { error: remote.error }
+        }
+        return out
+      }
+      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
+    })
+
+    harness.handle('list', async function () {
+      const lobby = await readLobby()
+      const local = Object.keys(lobby.rooms)
+        .map(function (code) {
+          const r = lobby.rooms[code]
+          if (r.status !== 'waiting') return null
+          return { code: r.code, game: r.game, gameName: GAMES[r.game].name, gameIcon: GAMES[r.game].icon, host: r.players[0] ? r.players[0].name : '', createdAt: r.createdAt }
+        })
+        .filter(function (x) { return x !== null })
+        .sort(function (a, b) { return a.createdAt - b.createdAt })
+      let remote = []
+      if (p2p) {
+        try { remote = await p2p.remoteRooms() } catch (e) { remote = [] }
+      }
+      return { local: local, remote: remote }
+    })
+
+    harness.handle('state', async function (args) {
+      const code = sanitizeCode(args && args.code)
+      if (!code) return null
+      const lobby = await readLobby()
+      const room = lobby.rooms[code]
+      if (!room) return null
+      return roomView(room, sanitizePlayerId((args && args.playerId) || null))
+    })
+
+    harness.handle('move', async function (args) {
+      const code = sanitizeCode(args && args.code)
+      let out = null
+      await mutateLobby(function (lobby) {
+        out = applyPlayerMove(lobby, code, sanitizePlayerId(args && args.playerId), args && args.move)
+      })
+      if (!out || out.error) {
+        if (p2p && out && out.error === '房间不存在或已过期') {
+          const remote = await p2p.remoteMove(code, sanitizePlayerId(args && args.playerId), args && args.move)
+          if (remote && remote.ok) return remote
+          if (remote && remote.error) return { error: remote.error }
+        }
+        return out
+      }
+      return out
+    })
+
+    harness.handle('leave', async function (args) {
+      const code = sanitizeCode(args && args.code)
+      const pid = sanitizePlayerId(args && args.playerId)
+      if (p2p && !(await readLobby()).rooms[code]) {
+        await p2p.remoteLeave(code, pid)
+        return { ok: true }
+      }
+      await mutateLobby(function (lobby) { leaveRoom(lobby, code, pid) })
+      return { ok: true }
+    })
+
+    harness.handle('share', async function (args) {
+      const code = sanitizeCode(args && args.code)
+      const lobby = await readLobby()
+      const room = lobby.rooms[code]
+      if (!room) return { error: '房间不存在' }
+      return sharePayload(room)
+    })
+
+    // ---------- model-visible tool ----------
     const agentId = 'agent-' + Math.random().toString(36).slice(2, 8)
     const gameTool = {
       name: 'game_hub',
-      description: '博弈小屋：创建博弈游戏房间、快速匹配、加入房间、查询房间状态、以 AI 身份落子。用于和用户或其他会话进行博弈游戏对局，房间号可分享给任何人加入。',
+      description: '博弈小屋：创建博弈游戏房间、快速匹配、加入房间、查询房间状态、以 AI 身份落子。支持局域网 P2P：可发现同一局域网内其他在线实例并加入其房间。',
       parameters: {
         type: 'object',
         properties: {
-          action: { type: 'string', enum: ['create', 'quick', 'join', 'list', 'state', 'move', 'share', 'peers'], description: '操作：create 创建房间(可选 withBot)，quick 快速匹配，join 按房间号加入，list 列出所有房间，state 查看房间状态，move 落子，share 生成邀请文本，peers 查看在线实例' },
+          action: { type: 'string', enum: ['create', 'quick', 'join', 'list', 'state', 'move', 'share', 'peers'], description: '操作：create 创建房间(可选 withBot)，quick 快速匹配，join 按房间号加入（本地或局域网远程），list 列出本地+远程房间，state 查看房间状态，move 落子，share 生成邀请文本，peers 查看局域网在线实例' },
           game: { type: 'string', enum: ['rps', 'pd', 'ttt', 'gongyu'], description: '游戏：rps=石头剪刀布, pd=囚徒困境, ttt=井字棋, gongyu=共鱼(4人鱼塘博弈)' },
           code: { type: 'string', description: '房间号（join/state/move/share 需要，4位大写字母数字）' },
           move: { type: 'string', description: '落子：rps=rock/paper/scissors，pd=cooperate/defect，ttt=0-8 格编号，gongyu 捕鱼阶段=1/2/3、惩罚阶段=skip 或目标玩家id' },
@@ -723,7 +1286,7 @@ module.exports = {
         required: ['action']
       },
       output: {
-        schema: { type: "object" },
+        schema: { type: 'object' },
         render: function (_args, value) {
           return [{ type: 'text', text: JSON.stringify(value, null, 2) }]
         }
@@ -749,20 +1312,31 @@ module.exports = {
               lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
               out = joinRoom(lobby, code, player)
             })
-            if (!out || out.error) return { ok: false, error: (out && out.error) || '加入失败' }
+            if (!out || out.error) {
+              if (p2p && out && out.error === '房间不存在或已过期') {
+                const remote = await p2p.remoteJoin(code, player)
+                if (remote && remote.ok) return { ok: true, code: code, room: remote.room, share: remote.share }
+                if (remote && remote.error) return { ok: false, error: remote.error }
+              }
+              return { ok: false, error: (out && out.error) || '加入失败' }
+            }
             return { ok: true, code: out.room.code, room: roomView(out.room, player.id) }
           }
           if (action === 'list') {
             const lobby = await readLobby()
-            return { ok: true, rooms: Object.keys(lobby.rooms).map(function (code) {
+            const local = Object.keys(lobby.rooms).map(function (code) {
               const r = lobby.rooms[code]
               return { code: r.code, game: r.game, gameName: GAMES[r.game].name, status: r.status, players: r.players.map(function (p) { return { name: p.name, isBot: !!p.isBot } }) }
-            }) }
+            })
+            let remote = []
+            if (p2p) {
+              try { remote = await p2p.remoteRooms() } catch (e) { remote = [] }
+            }
+            return { ok: true, rooms: local, remoteRooms: remote }
           }
           if (action === 'peers') {
-            return { ok: true, self: publicPeerMeta(), rooms: await readLobby().then(function (lobby) {
-              return Object.keys(lobby.rooms).filter(function (code) { return lobby.rooms[code].status === 'waiting' }).map(function (code) { return { code: code, game: lobby.rooms[code].game } })
-            }) }
+            if (!p2p) return { ok: true, p2p: false, error: '此实例未启用 P2P（preset 环境）' }
+            return { ok: true, p2p: true, self: { id: p2p.id, name: p2p.name(), addr: p2p.lanIp, port: p2p.port() }, peers: p2p.peers(), remoteRooms: await p2p.remoteRooms() }
           }
           if (action === 'state') {
             const code = sanitizeCode(args && args.code)
@@ -777,7 +1351,14 @@ module.exports = {
             await mutateLobby(function (lobby) {
               out = applyPlayerMove(lobby, code, player.id, args && args.move)
             })
-            if (!out || out.error) return { ok: false, error: (out && out.error) || '落子失败' }
+            if (!out || out.error) {
+              if (p2p && out && out.error === '房间不存在或已过期') {
+                const remote = await p2p.remoteMove(code, player.id, args && args.move)
+                if (remote && remote.ok) return { ok: true, room: remote.room }
+                if (remote && remote.error) return { ok: false, error: remote.error }
+              }
+              return { ok: false, error: (out && out.error) || '落子失败' }
+            }
             return { ok: true, room: out.room }
           }
           if (action === 'share') {
