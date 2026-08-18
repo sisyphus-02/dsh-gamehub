@@ -1,4 +1,4 @@
 # 博弈小屋 GameHub —— 能力 preset：每个会话自动挂载博弈大厅。
 # 插件不发布服务（只注册 game_hub 工具与只读 HTTP 路由），无需 isolate realm。
 - id: gamehub
-  name: './gamehub.plugin.2.js'
+  name: './gamehub.plugin.8.js'

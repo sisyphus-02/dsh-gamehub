@@ -18,6 +18,211 @@ const P2P_MCAST_PORT = 45777
 const P2P_INTERVAL_MS = 10000   // 广播/清理周期
 const P2P_PEER_TTL_MS = 30000   // 实例 30s 无心跳则视为离线
 
+const GAMEHUB_PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎮 博弈小屋</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;background:linear-gradient(180deg,#0b2545,#134074);color:#eef4ed;min-height:100vh}
+.wrap{max-width:520px;margin:0 auto;padding:16px}
+h1{font-size:24px;text-align:center;margin:8px 0 2px}
+.sub{text-align:center;opacity:.7;font-size:12px;margin-bottom:14px}
+.card{background:rgba(255,255,255,.08);border-radius:14px;padding:14px;margin-bottom:12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.btn{flex:1;border:none;border-radius:10px;padding:10px 0;font-size:14px;font-weight:700;cursor:pointer;background:#f4a259;color:#1a1a1a}
+.btn.ghost{background:rgba(255,255,255,.15);color:#eef4ed}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.small{flex:0 0 auto;padding:6px 14px;font-size:12px;border-radius:8px}
+.game{background:rgba(255,255,255,.07);border-radius:12px;padding:12px;margin-bottom:10px}
+.game h3{font-size:15px;margin-bottom:2px}
+.game .desc{font-size:12px;opacity:.7;margin-bottom:8px}
+.game .btns{display:flex;gap:6px}
+.game .btns .btn{flex:1;font-size:12px;padding:8px 0}
+input{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);border-radius:10px;color:#eef4ed;padding:10px 12px;font-size:14px;flex:1;min-width:100px}
+input::placeholder{color:rgba(238,244,237,.4)}
+.code{font-size:30px;font-weight:700;letter-spacing:8px;text-align:center;padding:10px 0;font-family:monospace;color:#f4a259}
+.status{font-size:12px;padding:2px 10px;border-radius:999px;background:rgba(255,180,60,.25)}
+.status.on{background:rgba(90,200,120,.3)}
+.status.end{background:rgba(255,90,90,.3)}
+.msg{font-size:12px;color:#ff9a9a;margin:6px 0}
+.note{font-size:11px;opacity:.55;margin-top:6px}
+.log{font-size:12px;opacity:.85;line-height:1.7}
+textarea{width:100%;box-sizing:border-box;background:rgba(255,255,255,.06);border:1px dashed rgba(255,255,255,.35);border-radius:10px;color:#eef4ed;font-size:12px;padding:8px;resize:vertical;font-family:inherit}
+.board{display:grid;grid-template-columns:repeat(3,68px);gap:6px;justify-content:center;margin:12px 0}
+.cell{width:68px;height:68px;font-size:28px;background:rgba(255,255,255,.1);border:none;border-radius:10px;color:#eef4ed;cursor:pointer}
+.cell:disabled{cursor:not-allowed;opacity:.8}
+.moves{display:flex;gap:8px;justify-content:center;margin:12px 0}
+.moves .btn{flex:0 0 auto;padding:12px 18px;font-size:15px}
+.wait{font-size:13px;opacity:.75;text-align:center;padding:8px 0}
+.win{text-align:center;font-size:16px;font-weight:700;padding:12px 0;color:#7ee2a8}
+.pond{display:flex;align-items:center;justify-content:center;gap:8px;font-size:18px}
+.pond b{font-size:38px;color:#f4a259}
+.player{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.07);margin-bottom:6px;font-size:13px}
+.player.me{outline:1px solid #f4a259}
+.tag{font-size:11px;background:rgba(255,255,255,.15);padding:2px 6px;border-radius:6px}
+.medal{font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap" id="app"></div>
+<script>
+'use strict';
+const app = document.getElementById('app');
+let S = { pid:'', name:'', view:'lobby', games:[], room:null, invite:null, rooms:[], codeInput:'', msg:'', busy:false };
+
+function genPid(){ return 'u-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36).slice(-4); }
+function init(){
+  let pid = '';
+  try { pid = localStorage.getItem('gamehub_pid') || ''; } catch(e){}
+  if (!pid) { pid = genPid(); try { localStorage.setItem('gamehub_pid', pid); } catch(e){} }
+  let name = '';
+  try { name = localStorage.getItem('gamehub_name') || ''; } catch(e){}
+  S.pid = pid; S.name = name || '玩家' + pid.slice(-4);
+  api('games').then(function(r){ if (r && r.ok) { S.games = r.games; render(); } });
+  refreshRooms();
+}
+function api(path, body){
+  const opts = { method: body ? 'POST' : 'GET' };
+  if (body) opts.headers = { 'content-type': 'application/json' };
+  if (body) opts.body = JSON.stringify(body);
+  return fetch('/api/gamehub/' + path, opts).then(function(r){ return r.json(); }).catch(function(){ return { ok:false, error:'网络错误' }; });
+}
+function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return { '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]; }); }
+function refreshRooms(){
+  api('lobby').then(function(r){ if (r && r.ok) { S.rooms = r.rooms.filter(function(x){ return x.status === 'waiting'; }); render(); } });
+}
+function act(name, body){
+  body = body || {}; body.playerId = S.pid; body.name = S.name;
+  S.busy = true; S.msg = ''; render();
+  api(name, body).then(function(r){
+    S.busy = false;
+    if (!r || !r.ok) { S.msg = (r && r.error) || '操作失败'; render(); return; }
+    if (r.room) { S.room = r.room; S.invite = r.share || S.invite; S.view = 'room'; }
+    render();
+  });
+}
+function create(g, bot){ act('create', { game:g, withBot:!!bot }); }
+function quick(g){ act('quick', { game:g }); }
+function join(code){ act('join', { code:code }); }
+function move(m){ act('move', { code:S.room.code, move:m }); }
+function leave(){ act('leave', { code:S.room.code }); setTimeout(function(){ S.room=null; S.invite=null; S.view='lobby'; refreshRooms(); }, 300); }
+function saveName(){ const n = S.name.trim(); if (!n) return; S.name = n; try { localStorage.setItem('gamehub_name', n); } catch(e){} act('setName', { name:n }); S.msg = '昵称已保存'; render(); }
+
+function pollRoom(){
+  if (S.view !== 'room' || !S.room || S.room.status === 'finished') return;
+  api('room?code=' + S.room.code + '&playerId=' + S.pid).then(function(r){
+    if (r && r.ok && r.room) { S.room = r.room; S.invite = r.share || S.invite; render(); }
+  });
+}
+setInterval(pollRoom, 1500);
+
+function playerRow(p, i){
+  const score = S.room.scores ? (S.room.scores[p.id] || 0) : 0;
+  const me = p.id === S.pid ? ' me' : '';
+  const tag = p.isBot ? ' <span class="tag">AI</span>' : (p.id === S.pid ? ' <span class="tag">你</span>' : '');
+  return '<div class="player' + me + '"><span>' + esc(p.emoji || '') + ' ' + esc(p.name) + tag + '</span><span>得分 ' + score + '</span></div>';
+}
+
+function renderLobby(){
+  const games = S.games.map(function(g){
+    const extra = g.id === 'gongyu' ? ' · 4人同塘' : (g.kind === 'simultaneous' ? ' · 同时出招' : ' · 轮流落子');
+    return '<div class="game"><h3>' + g.icon + ' ' + esc(g.name) + '</h3><div class="desc">' + esc(g.desc) + extra + '</div>' +
+      '<div class="btns"><button class="btn" onclick="create(\'' + g.id + '\',false)">创建房间</button>' +
+      '<button class="btn ghost" onclick="quick(\'' + g.id + '\')">快速匹配</button>' +
+      '<button class="btn ghost" onclick="create(\'' + g.id + '\',true)">🤖 人机</button></div></div>';
+  }).join('');
+  const roomRows = S.rooms.map(function(r){
+    return '<div class="player"><span>' + r.gameIcon + ' ' + esc(r.gameName) + ' · ' + r.code + ' · 房主 ' + esc(r.players && r.players[0] ? r.players[0].name : '') + '</span>' +
+      '<button class="btn small" onclick="join(\'' + r.code + '\')">加入</button></div>';
+  }).join('') || '<div class="note">暂无等待中的房间</div>';
+  app.innerHTML = '<h1>🎮 博弈小屋</h1><div class="sub">博弈游戏大厅 · 房间号可任意形式分享</div>' +
+    '<div class="card"><div class="row"><input value="' + esc(S.name) + '" oninput="S.name=this.value" placeholder="昵称">' +
+    '<button class="btn small" onclick="saveName()">保存</button></div></div>' +
+    '<div class="card"><div class="row"><input value="' + esc(S.codeInput) + '" oninput="S.codeInput=this.value.toUpperCase()" placeholder="输入房间号加入" onkeydown="if(event.key===\'Enter\')join(S.codeInput.trim())">' +
+    '<button class="btn small" onclick="join(S.codeInput.trim())">加入房间</button></div></div>' +
+    games +
+    '<div class="sub">🕐 等待中的房间</div><div class="card">' + roomRows + '</div>' +
+    (S.msg ? '<div class="msg">' + esc(S.msg) + '</div>' : '');
+}
+
+function renderRoom(){
+  const r = S.room;
+  const chip = r.status === 'playing' ? '<span class="status on">对局中</span>' : r.status === 'finished' ? '<span class="status end">已结束</span>' : '<span class="status">等待中…</span>';
+  const players = (r.players || []).map(playerRow).join('');
+  let board = '';
+  if (r.kind === 'simultaneous'){
+    const canMove = r.status === 'playing' && !r.myMove && !S.busy;
+    const labels = r.moveLabels || {};
+    const btns = Object.keys(labels).map(function(k){ return '<button class="btn" ' + (canMove ? '' : 'disabled') + ' onclick="move(\'' + k + '\')">' + esc(labels[k]) + '</button>'; }).join('');
+    let wait = r.myMove ? (r.bothMoved ? '双方已出招 ✓' : '已出招，等待对手…') : (r.status === 'playing' ? (r.oppMoved ? '对手已出招，轮到你了！' : '请出招') : '');
+    let last = r.lastRound ? '<div class="log">第 ' + r.lastRound.round + ' 回合：' + r.lastRound.a + ' vs ' + r.lastRound.b + ' → ' + (r.lastRound.winner ? (r.lastRound.winner === S.pid ? '你赢了' : '对手赢了') : '平局') + '</div>' : '';
+    board = '<div class="moves">' + btns + '</div><div class="wait">' + wait + '</div>' + last +
+      (r.game === 'pd' ? '<div class="note">收益：合作+合作=3/3 · 你背叛=5/0 · 对方背叛你=0/5 · 都背叛=1/1（5回合）</div>' : '');
+  } else if (r.kind === 'turn' && r.board){
+    const myIdx = (r.players || []).findIndex(function(pl){ return pl.id === S.pid; });
+    const myTurn = r.turn === myIdx;
+    const cells = r.board.map(function(cell, i){
+      return '<button class="cell" ' + (r.status === 'playing' && myTurn && cell === null && !S.busy ? '' : 'disabled') + ' onclick="move(\'' + i + '\')">' + (cell || '') + '</button>';
+    }).join('');
+    board = '<div class="wait">' + (r.status === 'playing' ? (myTurn ? '轮到你落子（' + (myIdx === 0 ? 'X' : 'O') + '）' : '等待对手落子…') : '对局结束') + '</div><div class="board">' + cells + '</div>';
+  } else if (r.game === 'gongyu'){
+    const phase = r.phase || 'catch';
+    const myTurn = r.punishTurn === S.pid;
+    let phaseBox = '';
+    if (r.status === 'playing' && phase === 'catch'){
+      const can = !r.myCatch && !S.busy;
+      phaseBox = '<div class="wait">' + (r.myCatch ? '已下网，等待收网…' : '暗选捞几条（别人看不到）') + '</div>' +
+        '<div class="moves">' + [1,2,3].map(function(n){ return '<button class="btn" ' + (can ? '' : 'disabled') + ' onclick="move(\'' + n + '\')">捞 ' + n + ' 条 🐟</button>'; }).join('') + '</div>' +
+        '<div class="note">人均可持续 ≈1.5 条/轮 —— 但别人可不会这么想</div>';
+    } else if (r.status === 'playing' && phase === 'punish'){
+      const opts = (r.punishOptions || []).map(function(o){ return '<button class="btn" onclick="move(\'' + esc(o.id) + '\')">咬 ' + o.emoji + ' ' + esc(o.name) + '</button>'; }).join('');
+      phaseBox = '<div class="wait">' + (myTurn ? '轮到你：惩罚阶段（花1分扣3分）' : '等待 ' + esc(r.punishTurnName || '对手') + ' 决策…') + '</div>' +
+        (myTurn ? '<div class="moves">' + opts + '<button class="btn ghost" onclick="move(\'skip\')">忍了，跳过</button></div>' : '');
+    }
+    let finals = '';
+    if (r.finals){
+      const order = (r.players || []).map(function(_,i){ return i; }).sort(function(a,b){ return (r.finals[r.players[b].id]||0) - (r.finals[r.players[a].id]||0); });
+      const medals = ['🥇','🥈','🥉',''];
+      finals = '<div class="card">' + order.map(function(i,k){ return '<div class="player"><span class="medal">' + medals[k] + ' ' + esc(r.players[i].emoji||'') + ' ' + esc(r.players[i].name) + '</span><b>' + r.finals[r.players[i].id] + '</b></div>'; }).join('') + '</div>';
+    }
+    board = '<div class="card"><div class="pond">🐟 × <b>' + (r.pond||0) + '</b> <span style="font-size:12px;opacity:.7">/ 20</span></div>' +
+      '<div class="wait">第 ' + r.round + '/' + r.rounds + ' 轮 · ' + (r.collapsed ? '💀 鱼塘已枯竭' : (phase === 'catch' ? '捕鱼阶段' : '惩罚阶段')) + '</div></div>' + phaseBox + finals;
+  }
+  const log = (r.history || []).slice(-6).map(function(h){
+    if (r.game === 'gongyu') return '<div>第' + h.round + '轮：共捞 ' + h.total + ' 条 → 塘剩 ' + h.after + '×2' + ((h.punishes||[]).length ? ' · 咬人 ' + h.punishes.length + ' 次' : '') + '</div>';
+    if (r.game === 'pd'){
+      const isMe0 = (r.players||[])[0] && r.players[0].id === S.pid;
+      return '<div>第' + h.round + '轮：你 ' + (isMe0 ? h.a : h.b) + ' vs 对手 ' + (isMe0 ? h.b : h.a) + ' → 你 ' + (isMe0 ? h.p1 : h.p2) + ' / 对手 ' + (isMe0 ? h.p2 : h.p1) + '</div>';
+    }
+    return '';
+  }).join('') || '';
+  const win = r.status === 'finished' ? (function(){
+    if (!r.winner) return '<div class="win">平局！</div>';
+    const w = (r.players||[]).find(function(pl){ return pl.id === r.winner; });
+    return '<div class="win">' + esc(w ? w.name : '对手') + (w && w.id === S.pid ? '（你）' : '') + ' 获胜！🎉</div>';
+  })() : '';
+  app.innerHTML = '<h1>🎮 博弈小屋</h1><div class="sub">' + esc(r.gameIcon) + ' ' + esc(r.gameName) + ' · 房间号可分享</div>' +
+    '<div class="card"><div class="row"><b style="font-size:13px">房间</b>' + chip +
+    '<button class="btn small ghost" style="margin-left:auto" onclick="leave()">退出房间</button></div>' +
+    '<div class="code">' + r.code + '</div>' +
+    (S.invite && S.invite.text ? '<textarea rows="4" readonly onclick="this.select()">' + esc(S.invite.text) + '</textarea>' : '') +
+    '</div><div class="card">' + players + '</div>' + board + win +
+    (log ? '<div class="card log">' + log + '</div>' : '') +
+    (S.msg ? '<div class="msg">' + esc(S.msg) + '</div>' : '');
+}
+
+function render(){
+  if (S.busy && S.view === 'lobby') return;
+  if (S.view === 'room' && S.room) renderRoom(); else renderLobby();
+}
+init();
+</script>
+</body>
+</html>`
+
 module.exports = {
   inject: ['timer'],
   apply(ctx) {
@@ -906,6 +1111,36 @@ module.exports = {
       })
     }
 
+    // ---- 独立页面 ----
+    if (webServer) {
+      // 先清掉历史/旧实例占用的路由（进程级共享表），再注册，避免 duplicate
+      try {
+        const exact = webServer.exact
+        if (exact && typeof exact.delete === 'function') {
+          exact.delete('/api/gamehub/lobby')
+          exact.delete('/api/gamehub/room')
+          exact.delete('/api/gamehub/peers')
+          exact.delete('/api/gamehub/create')
+          exact.delete('/api/gamehub/join')
+          exact.delete('/api/gamehub/quick')
+          exact.delete('/api/gamehub/move')
+          exact.delete('/api/gamehub/leave')
+          exact.delete('/api/gamehub/games')
+          exact.delete('/api/gamehub/share')
+          exact.delete('/api/gamehub/setName')
+          exact.delete('/gamehub')
+        }
+      } catch (e) { /* ignore */ }
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/gamehub',
+        handler: function (req, res) {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          res.end(GAMEHUB_PAGE)
+        }
+      }))
+    }
+
     // ---------- HTTP API（只读 + 可写，全部校验） ----------
     if (webServer) {
       const respondJson = function (res, data, status) {
@@ -937,21 +1172,22 @@ module.exports = {
           req.on('error', function () { resolve({}) })
         })
       }
-      try {
-        const exact = webServer.exact
-        if (exact && typeof exact.delete === 'function') {
-          exact.delete('/api/gamehub/lobby')
-          exact.delete('/api/gamehub/room')
-          exact.delete('/api/gamehub/peers')
-          exact.delete('/api/gamehub/create')
-          exact.delete('/api/gamehub/join')
-          exact.delete('/api/gamehub/quick')
-          exact.delete('/api/gamehub/move')
-          exact.delete('/api/gamehub/leave')
-          exact.delete('/api/gamehub/games')
-          exact.delete('/api/gamehub/share')
+
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/api/gamehub/setName',
+        handler: async function (req, res) {
+          if (req.method !== 'POST') return respondJson(res, { ok: false, error: '需要 POST' }, 405)
+          const body = await readBody(req)
+          const pid = sanitizePlayerId(body && body.playerId)
+          const nm = sanitizeName((body && body.name) || '玩家')
+          if (!pid) return respondJson(res, { ok: false, error: '缺少 playerId' }, 400)
+          await mutateLobby(function (lobby) {
+            lobby.players[pid] = { name: nm, updatedAt: Date.now() }
+          })
+          respondJson(res, { ok: true, name: nm })
         }
-      } catch (e) { /* ignore */ }
+      }))
 
       ctx.effect(() => webServer.register({
         kind: 'exact',
@@ -1130,147 +1366,6 @@ module.exports = {
         }
       }))
     }
-
-    // ---------- Client RPC ----------
-    harness.handle('identify', async function (args) {
-      const sid = (args && args.sessionId) || null
-      const playerId = sid ? 'u-' + String(sid).replace(/[^a-zA-Z0-9_-]/g, '').slice(-28) : 'u-' + Math.random().toString(36).slice(2, 10)
-      let name = ''
-      await mutateLobby(function (lobby) {
-        const p = getPlayer(lobby, playerId)
-        name = p.name
-      })
-      return { playerId: playerId, name: name }
-    })
-
-    harness.handle('page-url', async function () {
-      let url = ''
-      try { if (webServer && webServer.port) url = 'http://127.0.0.1:' + webServer.port + '/gamehub' } catch (e) { url = '' }
-      return { url: url }
-    })
-
-    harness.handle('set-name', async function (args) {
-      const pid = args && args.playerId
-      const nm = sanitizeName((args && args.name) || '玩家')
-      if (!pid) return { error: '缺少 playerId' }
-      await mutateLobby(function (lobby) {
-        lobby.players[pid] = { name: nm, updatedAt: Date.now() }
-      })
-      return { ok: true, name: nm }
-    })
-
-    harness.handle('games', async function () {
-      return Object.keys(GAMES).map(function (id) {
-        const g = GAMES[id]
-        return { id: id, name: g.name, icon: g.icon, desc: g.desc, kind: g.kind, rounds: g.rounds, maxPlayers: g.maxPlayers, moveLabels: g.moveLabels }
-      })
-    })
-
-    harness.handle('create', async function (args) {
-      const player = playerOf(args)
-      const withBot = !!(args && args.withBot)
-      let out = null
-      await mutateLobby(function (lobby) {
-        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
-        out = createRoom(lobby, args && args.game, player, withBot)
-        if (!out.error) out.room.updatedAt = Date.now()
-      })
-      if (out.error) return out
-      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
-    })
-
-    harness.handle('quick', async function (args) {
-      const player = playerOf(args)
-      let out = null
-      await mutateLobby(function (lobby) {
-        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
-        out = quickMatch(lobby, args && args.game, player)
-      })
-      if (out.error) return out
-      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
-    })
-
-    harness.handle('join', async function (args) {
-      const player = playerOf(args)
-      const code = sanitizeCode(args && args.code)
-      if (!code) return { error: '请输入房间号' }
-      let out = null
-      await mutateLobby(function (lobby) {
-        lobby.players[player.id] = { name: player.name, updatedAt: Date.now() }
-        out = joinRoom(lobby, code, player)
-      })
-      if (out.error) {
-        if (p2p && out.error === '房间不存在或已过期') {
-          const remote = await p2p.remoteJoin(code, player)
-          if (remote && remote.ok) return { code: code, room: remote.room, share: remote.share }
-          if (remote && remote.error) return { error: remote.error }
-        }
-        return out
-      }
-      return { code: out.room.code, room: roomView(out.room, player.id), share: sharePayload(out.room) }
-    })
-
-    harness.handle('list', async function () {
-      const lobby = await readLobby()
-      const local = Object.keys(lobby.rooms)
-        .map(function (code) {
-          const r = lobby.rooms[code]
-          if (r.status !== 'waiting') return null
-          return { code: r.code, game: r.game, gameName: GAMES[r.game].name, gameIcon: GAMES[r.game].icon, host: r.players[0] ? r.players[0].name : '', createdAt: r.createdAt }
-        })
-        .filter(function (x) { return x !== null })
-        .sort(function (a, b) { return a.createdAt - b.createdAt })
-      let remote = []
-      if (p2p) {
-        try { remote = await p2p.remoteRooms() } catch (e) { remote = [] }
-      }
-      return { local: local, remote: remote }
-    })
-
-    harness.handle('state', async function (args) {
-      const code = sanitizeCode(args && args.code)
-      if (!code) return null
-      const lobby = await readLobby()
-      const room = lobby.rooms[code]
-      if (!room) return null
-      return roomView(room, sanitizePlayerId((args && args.playerId) || null))
-    })
-
-    harness.handle('move', async function (args) {
-      const code = sanitizeCode(args && args.code)
-      let out = null
-      await mutateLobby(function (lobby) {
-        out = applyPlayerMove(lobby, code, sanitizePlayerId(args && args.playerId), args && args.move)
-      })
-      if (!out || out.error) {
-        if (p2p && out && out.error === '房间不存在或已过期') {
-          const remote = await p2p.remoteMove(code, sanitizePlayerId(args && args.playerId), args && args.move)
-          if (remote && remote.ok) return remote
-          if (remote && remote.error) return { error: remote.error }
-        }
-        return out
-      }
-      return out
-    })
-
-    harness.handle('leave', async function (args) {
-      const code = sanitizeCode(args && args.code)
-      const pid = sanitizePlayerId(args && args.playerId)
-      if (p2p && !(await readLobby()).rooms[code]) {
-        await p2p.remoteLeave(code, pid)
-        return { ok: true }
-      }
-      await mutateLobby(function (lobby) { leaveRoom(lobby, code, pid) })
-      return { ok: true }
-    })
-
-    harness.handle('share', async function (args) {
-      const code = sanitizeCode(args && args.code)
-      const lobby = await readLobby()
-      const room = lobby.rooms[code]
-      if (!room) return { error: '房间不存在' }
-      return sharePayload(room)
-    })
 
     // ---------- model-visible tool ----------
     const agentId = 'agent-' + Math.random().toString(36).slice(2, 8)
