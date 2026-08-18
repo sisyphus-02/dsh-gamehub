@@ -21,6 +21,8 @@
 
 ```
 .
+├── host/                   # Host 组合常驻版（侧栏入口 + 进程级常驻，见方式三）
+│   └── gamehub.ui.js       #   引擎 + HTTP API + P2P + /gamehub 页面 + 侧栏 🎮 按钮注入
 ├── preset/                 # Agent Preset 版（推荐，随 DSH 常驻）
 │   ├── agent.cordis.yml    #   preset 组合文件
 │   ├── gamehub.plugin.8.js #   完整插件（引擎 + 工具 + 只读 HTTP API + 局域网 P2P）
@@ -33,6 +35,8 @@
     └── 共鱼.html           # 共鱼游戏原型（浏览器单机版）
 ```
 
+> ⚠️ 插件文件名带版本号（`.8.js`）是为了规避 Node ESM 模块缓存：DSH 进程内同一路径的插件文件只加载一次，修改后必须改文件名才会重新加载。
+
 ## 安装（方式一：Agent Preset，推荐）
 
 把 `preset/` 目录放进 DSH 的 preset 根目录，然后选择"博弈小屋"作为会话 preset：
@@ -44,8 +48,6 @@ cp preset/agent.cordis.yml preset/gamehub.plugin.8.js preset/preset.yml ~/.dsh/.
 ```
 
 之后新建会话时选择"博弈小屋" preset，该会话自动拥有 `game_hub` 工具和游戏大厅。
-
-> ⚠️ 插件文件名带版本号（`.3.js`）是为了规避 Node ESM 模块缓存：DSH 进程内同一路径的插件文件只加载一次，修改后必须改文件名才会重新加载。
 
 ### 零对话加载：设为默认 preset（可选）
 
@@ -70,7 +72,29 @@ agent-presets:
 
 之后**每个新会话自动加载**博弈小屋（工具 + HTTP API + 局域网 P2P），零对话、零选择。验证：`curl http://127.0.0.1:3080/api/gamehub/peers` 返回在线实例即生效。
 
-## 安装（方式二：动态插件）
+## 安装（方式二：Host 组合常驻版，侧栏入口 + 进程级常驻）
+
+前两种方式的能力挂在**会话**上（新会话自动有，但进程里没有会话时 API 不在线，也没有侧栏按钮）。要**彻底常驻**——DSH 启动即有大厅 API / P2P / 独立页面 / **侧栏 🎮 按钮（点开即弹大厅浮层）**，且与任何会话无关——把插件装进 web profile 的 host 组合：
+
+```bash
+# 1) 把插件放进 profile 目录
+cp host/gamehub.ui.js ~/.dsh/profiles/web/gamehub.ui.js
+
+# 2) 在 ~/.dsh/profiles/web/cordis.patch.yml 追加：
+#    - insert:
+#        - id: gamehub-ui
+#          name: './gamehub.ui.js'
+```
+
+重启 DSH 后：
+- `http://127.0.0.1:3080/gamehub` 独立页面常驻（无需任何会话）
+- 每个页面左下角出现 🎮 按钮，点击弹出大厅浮层（iframe，样式经 shadow DOM 隔离，不影响原页面）
+- `GET /api/gamehub/*` 与局域网 P2P 进程级常驻
+- 工具侧仍由 preset（方式一）按会话提供 `game_hub` 工具
+
+> 侧栏按钮通过 `webServer.tapIndex` 注入页面脚本实现（与 DSH 官方 client-modules 注入启动清单同机制），纯 host 半、无 npm 包依赖；DSH 自身 client 插件体系只支持带 `dsh.client` 声明的 npm 包，本地文件插件无法走该通道，故用页面注入实现 UI 入口。
+
+## 安装（方式三：动态插件）
 
 在 DSH 会话中让助手读取 `dynamic/plugin/gamehub.host.js` 和 `gamehub.client.js`，用 `cordis_define` 创建并运行动态插件（code.host / code.client 分别填入两个文件内容）。
 
